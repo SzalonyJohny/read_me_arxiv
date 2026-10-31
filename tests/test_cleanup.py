@@ -1,0 +1,325 @@
+"""Clean-up pass tests with a fake client that answers with real SDK response objects."""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+
+import anthropic
+import httpx2
+import pytest
+from anthropic.types import Message, TextBlock, ThinkingBlock, Usage
+
+from paper_reader import cleanup
+from paper_reader.cleanup import SYSTEM_PROMPT, cleanup_paper, guard_accepts, llm_available, plan_requests
+from paper_reader.models import Block, Paper, Section
+from paper_reader.textfilter import apply_filter, equation_speech, filter_text
+
+_REQUEST = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+def _message(text: str, *, stop_reason: str = "end_turn", input_tokens: int = 400, output_tokens: int = 120,
+             cache_read: int = 0, cache_write: int = 0) -> Message:
+    return Message(
+        id="msg_test", type="message", role="assistant", model="claude-haiku-5-5",
+        content=[ThinkingBlock(type="thinking", thinking="", signature="sig"), TextBlock(type="text", text=text)],
+        stop_reason=stop_reason, stop_sequence=None,
+        usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens,
+                    cache_read_input_tokens=cache_read, cache_creation_input_tokens=cache_write),
+    )
+
+
+def _blocks_in(request_kwargs: dict) -> list[dict]:
+    content = request_kwargs["messages"][0]["content"]
+    return json.loads(content[content.index("\n["):])
+
+
+class FakeClient:
+    """client.messages.create(**kwargs) -> Message; `answer(blocks)` decides the speech per block."""
+
+    def __init__(self, answer=None, *, error: Exception | None = None, raw_text: str | None = None,
+                 stop_reason: str = "end_turn"):
+        self.answer = answer or (lambda blocks: [{"id": b["id"], "speech": b["filter_speech"]} for b in blocks])
+        self.error, self.raw_text, self.stop_reason = error, raw_text, stop_reason
+        self.calls: list[dict] = []
+        self.lock = threading.Lock()
+        self.messages = self
+
+    def create(self, **kwargs) -> Message:
+        with self.lock:
+            first = not self.calls
+            self.calls.append(kwargs)
+        error = self.error(kwargs) if callable(self.error) else self.error
+        if error:
+            raise error
+        text = self.raw_text if self.raw_text is not None else json.dumps({"blocks": self.answer(_blocks_in(kwargs))})
+        return _message(text, stop_reason=self.stop_reason,
+                        cache_write=0 if not first else 3000, cache_read=3000 if not first else 0)
+
+
+def _paper() -> Paper:
+    intro = [
+        Block(id="b0001", type="paragraph", text="Unlike [CITE], who rely on motion capture, we estimate the state on board."),
+        Block(id="b0002", type="paragraph", text=r"We set $\alpha = 0.5$ and $\gamma = 0.99$ in all experiments, see Fig. 2."),
+        Block(id="b0003", type="figure", figure_id="S1.F2", speak=False),
+    ]
+    method = [
+        Block(id="b0004", type="paragraph", text="We train the world model by minimizing a reconstruction loss and a KL term:"),
+        Block(id="b0005", type="equation", eq_number="4",
+              latex=r"\mathcal{L} = \sum_{t=1}^{T} \| \hat{x}_t - x_t \|^2 + \beta \, D_{\mathrm{KL}}(q \,\|\, p)"),
+        Block(id="b0006", type="list_item", text="(1) The policy, trained with PPO for 10M steps in simulation, "
+                                                 "transfers zero-shot to the real robot (Table 1)."),
+    ]
+    paper = Paper(paper_id="t.1v1", arxiv_id="t.1", title="Test paper", source_url="x", sections=[
+        Section(id="S1", number="1", title="Introduction", blocks=intro),
+        Section(id="S2", number="2", title="Method", blocks=method),
+    ])
+    apply_filter(paper)
+    return paper
+
+
+GOOD_ANSWERS = {
+    "b0001": "Unlike earlier work, which relies on motion capture, we estimate the state on board.",
+    "b0002": "We set alpha to 0.5 and gamma to 0.99 in all experiments, see Figure 2.",
+    "b0004": "We train the world model by minimizing a reconstruction loss and a KL term:",
+    "b0005": "Equation 4: the loss L is the squared error between x hat t and x t, summed over time steps, "
+             "plus beta times the KL divergence between q and p.",
+    "b0006": "The policy transfers to the real robot.",  # a summary: must be rejected
+}
+
+
+def _good(blocks):
+    return [{"id": b["id"], "speech": GOOD_ANSWERS[b["id"]]} for b in blocks]
+
+
+def test_cleanup_applies_guarded_answers_and_accounts_usage():
+    paper = _paper()
+    progress = []
+    client = FakeClient(_good)
+    stats = cleanup_paper(paper, client=client, progress_cb=lambda f, msg: progress.append(f))
+    blocks = {b.id: b for b in paper.iter_blocks()}
+
+    for block_id in ("b0001", "b0002", "b0004", "b0005"):
+        assert blocks[block_id].speech == GOOD_ANSWERS[block_id]
+        assert blocks[block_id].speech_source == "llm"
+    assert blocks["b0006"].speech_source == "llm_rejected"
+    assert blocks["b0006"].speech == filter_text(blocks["b0006"].text)
+    assert blocks["b0003"].speech is None  # figures are never sent
+    assert (stats.blocks_llm, stats.blocks_rejected) == (4, 1)
+
+    assert len(client.calls) == 2  # one request per section
+    assert (stats.input_tokens, stats.output_tokens) == (800, 240)
+    assert (stats.cache_creation_input_tokens, stats.cache_read_input_tokens) == (3000, 3000)
+    expected = (800 * 0.10 + 3000 * 1.25 * 0.10 + 3000 * 0.1 * 0.10 + 240 * 0.50) / 1e6
+    assert stats.cost_usd == pytest.approx(expected, abs=1e-6)
+    assert stats.model == "claude-haiku-5-5" and stats.skipped_reason is None
+    assert paper.cleanup is stats
+    assert progress == [0.5, 1.0]
+
+
+def test_request_shape():
+    paper = _paper()
+    client = FakeClient()
+    cleanup_paper(paper, client=client)
+    for call in client.calls:
+        assert call["model"] == "claude-haiku-5-5"
+        assert call["system"] == [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+        assert call["output_config"]["effort"] == "low"
+        assert call["output_config"]["format"]["type"] == "json_schema"
+        assert call["messages"][-1]["role"] == "user"  # no assistant prefill (a 400 on Haiku 5.5)
+        assert not {"temperature", "top_p", "top_k", "thinking"} & call.keys()
+    equation = next(b for c in client.calls for b in _blocks_in(c) if b["type"] == "equation")
+    assert equation["eq_number"] == "4" and equation["latex"].startswith(r"\mathcal{L}")
+    assert equation["context"].startswith("We train the world model")
+    assert equation["context_after"].startswith("(1) The policy")
+    assert equation["filter_speech"] == "Equation 4."
+
+
+def test_long_sections_are_chunked(monkeypatch):
+    monkeypatch.setattr(cleanup, "MAX_CHUNK_CHARS", 400)
+    paper = _paper()
+    requests = plan_requests(paper)
+    assert [[b.id for b in r.blocks] for r in requests] == [["b0001"], ["b0002"], ["b0004"], ["b0005"], ["b0006"]]
+    assert all(r.user_message.startswith("Paper: Test paper\nSection: Section ") for r in requests)
+
+    client = FakeClient()
+    stats = cleanup_paper(paper, client=client)
+    assert len(client.calls) == 5
+    assert [b["id"] for b in _blocks_in(client.calls[0])] == ["b0001"]  # the cache-warming request ran first
+    assert sorted(b["id"] for c in client.calls for b in _blocks_in(c)) == ["b0001", "b0002", "b0004", "b0005", "b0006"]
+    assert stats.blocks_llm == 5
+
+
+def test_missing_and_extra_ids():
+    paper = _paper()
+
+    def answer(blocks):
+        replies = [{"id": b["id"], "speech": GOOD_ANSWERS[b["id"]]} for b in blocks if b["id"] != "b0002"]
+        return replies + [{"id": "b9999", "speech": "Invented."}]
+
+    stats = cleanup_paper(paper, client=FakeClient(answer))
+    b0002 = next(b for b in paper.iter_blocks() if b.id == "b0002")
+    assert b0002.speech_source == "filter"
+    assert b0002.speech == filter_text(b0002.text)
+    assert (stats.blocks_llm, stats.blocks_rejected) == (3, 1)  # b0006 is the rejected summary
+    assert any("1 block(s) missing" in w for w in paper.warnings)
+    assert all(b.id != "b9999" for b in paper.iter_blocks())
+
+
+def test_authentication_error_stops_the_run():
+    paper = _paper()
+    before = [b.speech for b in paper.iter_blocks()]
+    error = anthropic.AuthenticationError("invalid x-api-key", response=httpx2.Response(401, request=_REQUEST), body=None)
+    client = FakeClient(error=error)
+    stats = cleanup_paper(paper, client=client)
+    assert len(client.calls) == 1  # the first request fails alone; the rest never start
+    assert stats.skipped_reason.startswith("AuthenticationError")
+    assert [b.speech for b in paper.iter_blocks()] == before
+    assert all(b.speech_source in ("filter", None) for b in paper.iter_blocks())
+    assert stats.cost_usd == 0
+
+
+def test_other_errors_keep_the_filter_text_for_that_section():
+    paper = _paper()
+
+    def error(kwargs):
+        if any(b["id"] == "b0004" for b in _blocks_in(kwargs)):
+            return anthropic.InternalServerError("overloaded", response=httpx2.Response(500, request=_REQUEST), body=None)
+        return None
+
+    stats = cleanup_paper(paper, client=FakeClient(_good, error=error))
+    sources = {b.id: b.speech_source for b in paper.iter_blocks()}
+    assert sources["b0001"] == sources["b0002"] == "llm"
+    assert sources["b0004"] == sources["b0005"] == "filter"
+    assert stats.skipped_reason is None
+    assert any("InternalServerError" in w for w in paper.warnings)
+
+
+@pytest.mark.parametrize(("client", "warning"), [
+    (FakeClient(raw_text="not json"), "not the expected JSON"),
+    (FakeClient(raw_text='{"blocks": [{"id": "b0001"}]}'), "not the expected JSON"),
+    (FakeClient(stop_reason="refusal"), "declined"),
+    (FakeClient(stop_reason="max_tokens"), "cut off"),
+])
+def test_unusable_answers_keep_the_filter_text(client, warning):
+    paper = _paper()
+    stats = cleanup_paper(paper, client=client)
+    assert stats.blocks_llm == 0
+    assert all(b.speech_source in ("filter", None) for b in paper.iter_blocks())
+    assert sum(warning in w for w in paper.warnings) == 2
+    assert stats.input_tokens == 800  # billed even when unusable
+
+
+def test_equation_label_is_kept():
+    paper = _paper()
+    answer = {**GOOD_ANSWERS, "b0005": "The loss is the squared error plus beta times the KL divergence."}
+    cleanup_paper(paper, client=FakeClient(lambda blocks: [{"id": b["id"], "speech": answer[b["id"]]} for b in blocks]))
+    b0005 = next(b for b in paper.iter_blocks() if b.id == "b0005")
+    assert b0005.speech == "Equation 4: The loss is the squared error plus beta times the KL divergence."
+
+
+def test_skips_cleanly_without_credentials(monkeypatch, tmp_path):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path))
+    assert llm_available() == (False, "no ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN / ant profile)")
+    paper = _paper()
+    stats = cleanup_paper(paper)
+    assert stats.skipped_reason.startswith("no ANTHROPIC_API_KEY")
+    assert all(b.speech_source in ("filter", None) for b in paper.iter_blocks())
+
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "default.json").write_text("{}")
+    assert llm_available() == (True, None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert llm_available() == (True, None)
+
+
+def _paragraph(text: str) -> Block:
+    block = Block(id="b1", type="paragraph", text=text)
+    block.speech = filter_text(text)
+    return block
+
+
+@pytest.mark.parametrize(("source", "speech", "accepted"), [
+    # legitimate repairs
+    ("Unlike [CITE], who rely on motion capture, we estimate the state on board.",
+     "Unlike earlier work, which relies on motion capture, we estimate the state on board.", True),
+    ("In contrast, [CITE] train one model for all tasks and all robots.",
+     "In contrast, earlier work trains one model for all tasks and all robots.", True),
+    (r"The policy $\pi_\theta$ maximizes $J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[\sum_{t=0}^{T} \gamma^t r_t]$.",
+     "The policy pi theta maximizes J of theta, the expected sum over t from 0 to T of gamma to the t times r t, "
+     "for tau drawn from pi theta.", True),
+    (r"We set $\alpha = 0.5$ and $\gamma = 0.99$.", "We set alpha to 0.5 and gamma to 0.99.", True),
+    ("The robot walks on stairs and slopes without any tuning.",
+     "The robot walks on stairs and slopes without any tuning.", True),
+    # rewrites
+    ("The policy, trained with PPO for ten million steps in simulation, transfers zero-shot to the real robot.",
+     "The policy transfers zero-shot to the real robot.", False),
+    ("We evaluate our approach on three challenging manipulation tasks in the real world.",
+     "Three challenging real-world manipulation tasks are used to evaluate the approach.", False),
+    ("The robot walks on stairs and slopes without any tuning.",
+     "The robot walks on stairs and slopes without any tuning, which is remarkable.", False),
+    # broken output
+    ("Results are in Fig. 3 and Tab. 1.", "Results are in the third figure and Table 1.", False),
+    (r"We set $\alpha = 0.5$.", r"We set $\alpha$ to 0.5.", False),
+    ("The controller is robust [CITE].", "The controller is robust [CITE].", False),
+    ("The controller is robust [CITE].", "", False),
+])
+def test_guard(source, speech, accepted):
+    assert guard_accepts(_paragraph(source), speech) is accepted
+
+
+def test_guard_for_equations():
+    block = Block(id="b1", type="equation", latex=r"\mathcal{L} = a + b", eq_number="4")
+    block.speech = equation_speech(block)
+    assert guard_accepts(block, "Equation 4: the total loss is the reconstruction loss plus beta times the KL term.")
+    assert not guard_accepts(block, "Equation 4: " + "and so on " * 40)
+    assert not guard_accepts(block, r"Equation 4: \mathcal{L} = a + b")
+
+
+def test_few_shot_examples_pass_the_guard_and_match_the_filter():
+    for example in cleanup._EXAMPLES:
+        if example.eq_number:
+            block = Block(id="x", type="equation", latex=example.source, eq_number=example.eq_number)
+            block.speech = equation_speech(block)
+        else:
+            block = _paragraph(example.source)
+        assert guard_accepts(block, example.speech), example.title
+        assert json.dumps(block.speech, ensure_ascii=False) in SYSTEM_PROMPT  # the prompt shows real filter output
+
+
+def test_system_prompt_is_stable_and_covers_the_rules():
+    assert cleanup._build_system_prompt() == SYSTEM_PROMPT
+    assert 12 <= SYSTEM_PROMPT.count("\nInput: ") <= 16
+    assert len(SYSTEM_PROMPT) / 4 > 512  # above Haiku 5.5's minimum cacheable prefix, even at 4 chars/token
+    sources = " ".join(e.source for e in cleanup._EXAMPLES)
+    for needle in ("[CITE].", "et al. [CITE]", "[CITE] proposed", "Fig. 3(b)", "Tab. II", "Eq. (5)", "Sec. 4.2",
+                   "e.g.,", "i.e.,", "w.r.t.", "SOTA", "3.2 ms", "1e-4", "±0.3", "∼40", r"\alpha", "$[0, 1]$",
+                   "10^{-4}", r"\sum", "https://"):
+        assert needle in sources, needle
+    assert any(e.source == e.speech for e in cleanup._EXAMPLES)  # a block that needs no change
+    assert not re.search(r"\d{4}-\d{2}-\d{2}|uuid", SYSTEM_PROMPT)
+
+
+def test_offline_export_and_import_use_the_same_requests_and_guard():
+    paper = _paper()
+    groups = cleanup.export_requests(paper, parts=2)
+    exported = sorted((r for group in groups for r in group), key=lambda r: r["request_id"])
+    assert len(groups) == 2
+    assert [r["user_message"] for r in exported] == [r.user_message for r in plan_requests(paper)]
+
+    answers = [{"id": i, "speech": GOOD_ANSWERS[i]} for r in exported for i in r["block_ids"]]
+    stats = cleanup.import_answers(paper, list(reversed(answers)), model="haiku-subagent")
+    blocks = {b.id: b for b in paper.iter_blocks()}
+    assert (stats.model, stats.blocks_llm, stats.blocks_rejected) == ("haiku-subagent", 4, 1)
+    assert blocks["b0001"].speech_source == "llm" and blocks["b0006"].speech_source == "llm_rejected"
+
+    # Importing again starts from the filter text, so the result is identical (idempotent).
+    again = cleanup.import_answers(paper, answers, model="haiku-subagent")
+    assert (again.blocks_llm, again.blocks_rejected) == (4, 1)
+    assert blocks["b0002"].speech == GOOD_ANSWERS["b0002"]
+
+    with pytest.raises(ValueError):
+        cleanup.import_answers(paper, [{"id": "b0001"}], model="x")

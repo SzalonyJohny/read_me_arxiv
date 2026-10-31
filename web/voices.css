@@ -1,0 +1,645 @@
+/* Voice lab page. Tokens and controls come from common.css. */
+
+.lab-main {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 28px 24px 96px;
+}
+
+.field-label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.8em;
+}
+
+/* ---------------------------------------------------------------- header */
+
+.back {
+  margin-left: -0.6rem;
+  padding: 0.4rem 0.6rem;
+  color: var(--text-2);
+  text-decoration: none;
+}
+
+.lab-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem 2rem;
+  margin: 0.75rem 0 1.25rem;
+}
+
+.lab-title-row h1 {
+  margin: 0 0 0.3rem;
+  font-family: var(--serif);
+  font-size: 2.25rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.lede {
+  margin: 0;
+  max-width: 60ch;
+  color: var(--text-2);
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.5;
+}
+
+.paper-pick {
+  display: grid;
+  gap: 0.25rem;
+  flex: 0 1 400px;
+  min-width: 0;
+}
+
+.paper-pick select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
+}
+
+.sample-text {
+  margin: 0 0 1rem;
+  padding: 0.9rem 1.2rem 1rem;
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.sample-text figcaption,
+.sel-kicker {
+  font-size: 0.6875rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sample-text figcaption {
+  color: var(--muted);
+}
+
+.sample-text blockquote {
+  margin: 0.35rem 0 0;
+  font-family: var(--serif);
+  font-size: 1.125rem;
+  line-height: 1.55;
+}
+
+.sample-text blockquote p {
+  margin: 0;
+}
+
+.selected-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.3rem 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+
+.sel-kicker {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.sel-value {
+  flex: 1 1 20rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sel-desc {
+  color: var(--text-2);
+  font-family: var(--serif);
+  font-style: italic;
+}
+
+.sel-link {
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.sel-link:hover {
+  text-decoration: underline;
+}
+
+#page-error {
+  margin-top: 1rem;
+}
+
+/* ---------------------------------------------------------------- sections */
+
+.lab-section {
+  margin-top: 2.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.section-head h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.section-head .sub {
+  margin-left: 0.4rem;
+  font-family: var(--sans);
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.section-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+}
+
+.jobs,
+.errors {
+  display: grid;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.jobs:empty,
+.errors:empty {
+  margin: 0;
+}
+
+.job {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.job-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.error.dismissable {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.error.dismissable span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.btn.dismiss {
+  padding: 0 0.4rem;
+  color: inherit;
+  font-size: 1.1rem;
+  line-height: 1.3;
+}
+
+.btn.mini {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8125rem;
+}
+
+.btn.danger {
+  color: var(--danger);
+}
+
+.btn.quiet.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+audio {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+}
+
+.not-rendered {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 36px;
+  margin: 0;
+  padding: 0.2rem 0.2rem 0.2rem 0.85rem;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+}
+
+p.not-rendered {
+  padding-right: 0.85rem;
+}
+
+.sel-btn {
+  min-width: 5.5rem;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.8125rem;
+}
+
+/* ---------------------------------------------------------------- Kokoro */
+
+.kk-group h3 {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 1.5rem 0 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.kk-group:first-child h3 {
+  margin-top: 0.5rem;
+}
+
+.kk-group .count {
+  padding: 0 0.45rem;
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.voice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vcard {
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.vcard.selected,
+.qcard.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.vcard.selected {
+  background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--surface);
+}
+
+.vcard-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.vcard-name {
+  display: grid;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.vcard-name strong {
+  overflow: hidden;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vcard-name code,
+.qmeta code {
+  color: var(--muted);
+}
+
+.vcard-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 1.9rem;
+}
+
+.grade {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  min-width: 2.1rem;
+  height: 2.1rem;
+  padding: 0 0.3rem;
+  border-radius: 6px;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.grade-a {
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
+  color: var(--ok);
+}
+
+.grade-b {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.grade-c {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+.grade-d,
+.grade-e,
+.grade-f,
+.grade-\? {
+  border: 1px dashed var(--border-strong);
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------- Qwen3-TTS */
+
+.help {
+  max-width: 78ch;
+  margin: 0 0 1rem;
+  color: var(--text-2);
+  font-size: 0.9375rem;
+}
+
+.design-form {
+  display: grid;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.design-form textarea {
+  width: 100%;
+  min-height: 4.5rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.design-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+}
+
+.model-picks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 1.25rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.model-picks legend {
+  float: left;
+  padding: 0;
+}
+
+.model-pick {
+  font-size: 0.9rem;
+}
+
+.model-pick .muted {
+  font-size: 0.75rem;
+}
+
+.design-note {
+  margin: 0;
+}
+
+.qwen-list {
+  display: grid;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.qcard {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.qcard.fresh {
+  animation: fresh 4s ease-out;
+}
+
+@keyframes fresh {
+  from {
+    box-shadow: 0 0 0 4px var(--reading-edge);
+  }
+}
+
+.qdesc {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.125rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.qdesc::before {
+  content: "“";
+}
+
+.qdesc::after {
+  content: "”";
+}
+
+.qmeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+}
+
+.qmeta code {
+  overflow-wrap: anywhere;
+}
+
+.badge.preset {
+  background: var(--warn-soft);
+  color: var(--text-2);
+}
+
+.clip-rows {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.clip-row {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 1fr) 14rem;
+  grid-template-areas: "label player side";
+  align-items: center;
+  gap: 0.4rem 0.9rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 8px;
+}
+
+.clip-row.selected {
+  background: var(--accent-soft);
+}
+
+.clip-row.reference {
+  margin-bottom: 0.15rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.clip-label {
+  grid-area: label;
+  display: grid;
+  line-height: 1.25;
+}
+
+.clip-label strong {
+  font-size: 0.875rem;
+}
+
+.clip-row > audio,
+.clip-row > .not-rendered {
+  grid-area: player;
+}
+
+.clip-side {
+  grid-area: side;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.qcard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+/* ---------------------------------------------------------------- narrow screens */
+
+@media (max-width: 720px) {
+  .clip-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "label side"
+      "player player";
+  }
+
+  .clip-row.reference .clip-side {
+    display: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .lab-main {
+    padding: 16px 16px 72px;
+  }
+
+  .lab-title-row h1 {
+    font-size: 1.85rem;
+  }
+
+  .lede {
+    font-size: 1rem;
+  }
+
+  .section-head .sub {
+    display: block;
+    margin: 0.15rem 0 0;
+  }
+
+  .paper-pick {
+    flex-basis: 100%;
+  }
+
+  .sample-text {
+    padding: 0.8rem 1rem 0.9rem;
+  }
+
+  .sample-text blockquote {
+    font-size: 1.0625rem;
+  }
+
+  .section-tools {
+    width: 100%;
+  }
+
+  .section-tools .btn {
+    flex: 1 1 100%;
+  }
+
+  .design-form {
+    padding: 0.9rem 1rem;
+  }
+
+  .design-row .btn.primary {
+    flex: 1 1 100%;
+  }
+
+  .qcard {
+    padding: 0.9rem;
+  }
+}

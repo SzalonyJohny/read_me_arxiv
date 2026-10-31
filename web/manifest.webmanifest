@@ -1,0 +1,14 @@
+{
+  "name": "Paper Reader",
+  "short_name": "Papers",
+  "description": "Read and listen to scientific papers, with figures and equations, also offline.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f5f0",
+  "theme_color": "#2b5c8e",
+  "icons": [
+    {"src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}

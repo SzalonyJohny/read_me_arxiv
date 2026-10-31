@@ -1,0 +1,35 @@
+[project]
+name = "paper-reader-ocr-worker"
+version = "0.1.0"
+description = "Isolated env for DeepSeek-OCR 2 (run as a subprocess by paper_reader/pdf/ocr.py)"
+requires-python = ">=3.12,<3.13"
+# torch / torchvision match the main env's torch build (2.11.0+cu128, sm_120 capable), so uv
+# hard-links them from its cache instead of storing a second copy. The model's remote code needs
+# torchvision, einops, addict, easydict and matplotlib, which the main env doesn't have (and must not get).
+dependencies = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "transformers==4.57.3",
+    "tokenizers",
+    "accelerate",
+    "safetensors",
+    "einops",
+    "addict",
+    "easydict",
+    "matplotlib",  # only imported by the remote code's geometry-plot branch, but transformers checks all imports
+    "pymupdf",
+    "pillow",
+    "numpy",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

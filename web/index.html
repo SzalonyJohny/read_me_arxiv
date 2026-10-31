@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paper Reader</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect x=%272%27 y=%271%27 width=%2712%27 height=%2714%27 rx=%272%27 fill=%27%232b5c8e%27/%3E%3Cpath d=%27M5 5h6M5 8h6M5 11h4%27 stroke=%27white%27 stroke-width=%271.3%27/%3E%3C/svg%3E">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#2b5c8e">
+  <link rel="stylesheet" href="/static/vendor/fonts/source-serif-4.css">
+  <link rel="stylesheet" href="/static/common.css">
+  <style>
+    .home-main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 56px 20px 80px;
+    }
+
+    .masthead-top {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem 1rem;
+      margin-bottom: 0.4rem;
+    }
+
+    .masthead-link {
+      text-decoration: none;
+    }
+
+    .masthead h1 {
+      margin: 0;
+      font-family: var(--serif);
+      font-size: 2.25rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .masthead p {
+      margin: 0 0 2rem;
+      max-width: 58ch;
+      color: var(--text-2);
+      font-family: var(--serif);
+      font-size: 1.125rem;
+      line-height: 1.55;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+    }
+
+    .ingest,
+    .url-form {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .ingest > * {
+      min-width: 0;
+    }
+
+    .field-label {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-2);
+    }
+
+    .url-row {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .url-row input {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1.5rem;
+      font-size: 0.9rem;
+    }
+
+    .options .check:has(select) {
+      min-width: 0;
+    }
+
+    .options select {
+      min-width: 0;
+      max-width: 100%;
+      text-overflow: ellipsis;
+    }
+
+    .option-note {
+      flex-basis: 100%;
+      margin: -0.25rem 0 0;
+      font-size: 0.8125rem;
+    }
+
+    /* ---- PDF upload: drop zone, then the analysis card with the method choice */
+
+    .or {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin: -0.25rem 0;
+      font-size: 0.8125rem;
+      color: var(--muted);
+    }
+
+    .or::before,
+    .or::after {
+      content: "";
+      flex: 1;
+      border-top: 1px solid var(--border);
+    }
+
+    .dropzone {
+      border: 1.5px dashed var(--border-strong);
+      border-radius: 10px;
+      transition: border-color 0.15s ease, background-color 0.15s ease;
+    }
+
+    .dropzone:hover:has(.dropzone-btn:not(:disabled)),
+    .dropzone.dragging {
+      border-color: var(--accent);
+      background: var(--hover);
+    }
+
+    .dropzone.dragging {
+      border-style: solid;
+      background: var(--accent-soft);
+    }
+
+    .dropzone-btn {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+      width: 100%;
+      padding: 0.85rem 1rem;
+      border: 0;
+      border-radius: inherit;
+      background: none;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .dropzone-btn:focus-visible {
+      outline-offset: 3px;
+    }
+
+    .dropzone-btn:disabled {
+      cursor: progress;
+    }
+
+    .dz-icon {
+      display: grid;
+      place-items: center;
+      flex: none;
+      width: 2.5rem;
+      height: 2.5rem;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .dz-icon .icon {
+      width: 1.25rem;
+      height: 1.25rem;
+    }
+
+    .dz-icon .spinner,
+    .dropzone.uploading .dz-icon .icon {
+      display: none;
+    }
+
+    .dropzone.uploading .dz-icon .spinner {
+      display: block;
+    }
+
+    .dz-text {
+      display: grid;
+      gap: 0.1rem;
+      min-width: 0;
+    }
+
+    .dz-main {
+      font-size: 0.9375rem;
+    }
+
+    .dz-main strong {
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    .dz-hint {
+      font-size: 0.8125rem;
+      color: var(--muted);
+    }
+
+    .dz-drop,
+    .dz-busy,
+    .dropzone.dragging .dz-idle,
+    .dropzone.uploading .dz-idle {
+      display: none;
+    }
+
+    .dropzone.dragging .dz-drop,
+    .dropzone.uploading .dz-busy {
+      display: grid;
+    }
+
+    .dz-busy {
+      overflow-wrap: anywhere;
+    }
+
+    .pdf-card {
+      display: grid;
+      gap: 1rem;
+      padding: 1rem;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      transition: border-color 0.15s ease, background-color 0.15s ease;
+    }
+
+    .pdf-card.dragging {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .pdf-head {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.85rem;
+    }
+
+    .pdf-icon {
+      flex: none;
+      width: 2.1rem;
+      height: 2.6rem;
+      color: var(--accent);
+    }
+
+    .pdf-id {
+      min-width: 0;
+    }
+
+    .pdf-title {
+      margin: 0;
+      font-family: var(--serif);
+      font-size: 1.125rem;
+      font-weight: 600;
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
+
+    .pdf-meta {
+      margin: 0.2rem 0 0;
+      font-size: 0.8125rem;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .chips .badge {
+      padding: 0.15rem 0.6rem;
+    }
+
+    .methods {
+      display: grid;
+      gap: 0.5rem;
+      min-inline-size: 0;
+      margin: 0;
+      padding: 0;
+      border: 0;
+    }
+
+    .methods legend {
+      padding: 0;
+      margin-bottom: 0.5rem;
+    }
+
+    .method {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: start;
+      gap: 0.7rem;
+      padding: 0.7rem 0.85rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      cursor: pointer;
+      transition: border-color 0.15s ease, background-color 0.15s ease;
+    }
+
+    .method:hover:not(.unavailable) {
+      border-color: var(--border-strong);
+    }
+
+    .method:has(input:checked) {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .method input {
+      width: 1rem;
+      height: 1rem;
+      margin: 0.2rem 0 0;
+    }
+
+    .method.unavailable {
+      border-style: dashed;
+      background: transparent;
+      color: var(--muted);
+      cursor: not-allowed;
+    }
+
+    .methods:disabled .method {
+      cursor: not-allowed;
+    }
+
+    .m-top {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.2rem 0.5rem;
+    }
+
+    .m-label {
+      font-size: 0.9375rem;
+      font-weight: 600;
+    }
+
+    .m-time {
+      margin-left: auto;
+      font-size: 0.875rem;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-2);
+      white-space: nowrap;
+    }
+
+    .method.unavailable .m-time {
+      color: var(--muted);
+      text-decoration: line-through;
+    }
+
+    .m-note {
+      display: block;
+      margin-top: 0.15rem;
+      font-size: 0.8125rem;
+      color: var(--muted);
+    }
+
+    .pdf-total {
+      margin: 0;
+      font-size: 0.9375rem;
+      color: var(--text-2);
+    }
+
+    .pdf-total strong {
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .pdf-total .muted {
+      font-size: 0.875rem;
+    }
+
+    .pdf-card {
+      scroll-margin-top: 1rem;
+    }
+
+    .pdf-actions,
+    .progress {
+      scroll-margin-bottom: 1.5rem;
+    }
+
+    .pdf-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .library {
+      margin-top: 3rem;
+    }
+
+    .library h2 {
+      margin: 0 0 0.75rem;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .library ul {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      border-top: 1px solid var(--border);
+    }
+
+    .library li a {
+      display: flex;
+      align-items: baseline;
+      gap: 1rem;
+      padding: 0.85rem 0.25rem;
+      border-bottom: 1px solid var(--border);
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .library li a:hover .lib-title {
+      color: var(--accent);
+    }
+
+    .lib-text {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .lib-title {
+      display: block;
+      font-family: var(--serif);
+      font-size: 1.0625rem;
+      line-height: 1.35;
+    }
+
+    .lib-meta {
+      font-size: 0.8125rem;
+      color: var(--muted);
+    }
+
+    .lib-badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 0.35rem;
+    }
+
+    .badge.saved {
+      background: color-mix(in srgb, var(--ok) 14%, transparent);
+      color: var(--ok);
+    }
+
+    /* Offline: adding papers needs the server; the library lists what is saved on this device. */
+    .offline-note {
+      margin: 0 0 1rem;
+      padding: 0.65rem 0.85rem;
+      border-radius: 8px;
+      background: var(--warn-soft);
+      font-size: 0.9375rem;
+    }
+
+    .ingest.is-offline {
+      opacity: 0.5;
+    }
+
+    @media (max-width: 520px) {
+      .home-main {
+        padding-top: 32px;
+      }
+
+      .url-row {
+        flex-direction: column;
+      }
+
+      .pdf-card {
+        padding: 0.85rem;
+      }
+
+      .method {
+        padding: 0.65rem 0.75rem;
+      }
+
+      .pdf-actions .btn.primary {
+        flex: 1;
+      }
+    }
+  </style>
+  <script type="module" src="/static/index.js"></script>
+</head>
+<body>
+  <main class="home-main">
+    <header class="masthead">
+      <div class="masthead-top">
+        <h1>Paper Reader</h1>
+        <a class="btn masthead-link" href="/voices" title="Compare and choose narration voices">
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="1.5" width="5" height="8" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          Voice lab
+        </a>
+      </div>
+      <p>Paste an arXiv link or upload a PDF to get a clean reader with sections, equations and figures. Narration is priced first and only generated once you accept.</p>
+    </header>
+
+    <p class="offline-note" id="offline-note" hidden>
+      <strong>Offline.</strong> Adding papers needs a connection to the server. The papers saved on this device are in the library below.
+    </p>
+
+    <div class="card ingest" id="ingest">
+      <form class="url-form" id="ingest-form" novalidate>
+        <label class="field-label" for="url">arXiv link</label>
+        <div class="url-row">
+          <input type="text" id="url" name="url" inputmode="url" autocomplete="off" spellcheck="false"
+                 placeholder="https://arxiv.org/pdf/2601.17428" required>
+          <button class="btn primary" type="submit" id="submit">Read paper</button>
+        </div>
+      </form>
+
+      <p class="or">or</p>
+
+      <!-- Drop zone: the whole page accepts a dropped PDF (see index.js); the button opens the file picker. -->
+      <div class="dropzone" id="pdf-drop">
+        <input type="file" id="pdf-file" accept=".pdf,application/pdf" hidden>
+        <button type="button" class="dropzone-btn" id="pdf-pick">
+          <span class="dz-icon" aria-hidden="true">
+            <svg class="icon" viewBox="0 0 20 20"><path d="M10 13V3.5M6 7l4-4 4 4M3.5 12.5v2.5a1.5 1.5 0 0 0 1.5 1.5h10a1.5 1.5 0 0 0 1.5-1.5v-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="spinner"></span>
+          </span>
+          <span class="dz-text dz-idle">
+            <span class="dz-main"><strong>Upload a PDF</strong>: drop it here or choose a file</span>
+            <span class="dz-hint">Up to 100 MB. You see a time estimate before anything runs.</span>
+          </span>
+          <span class="dz-text dz-drop">
+            <span class="dz-main"><strong>Drop the PDF</strong> to upload it</span>
+            <span class="dz-hint">One file, up to 100 MB</span>
+          </span>
+          <span class="dz-text dz-busy" role="status">
+            <span class="dz-main" id="pdf-busy-msg">Uploading…</span>
+            <span class="dz-hint">Reading the pages and estimating the processing time</span>
+          </span>
+        </button>
+      </div>
+
+      <section class="pdf-card" id="pdf-card" aria-labelledby="pdf-title" hidden>
+        <div class="pdf-head">
+          <svg class="pdf-icon" viewBox="0 0 34 42" aria-hidden="true"><path d="M5 1.5h17l10.5 10.5v25A3.5 3.5 0 0 1 29 40.5H5A3.5 3.5 0 0 1 1.5 37V5A3.5 3.5 0 0 1 5 1.5Z" fill="var(--accent-soft)" stroke="currentColor" stroke-width="1.5"/><path d="M22 1.5V9a3 3 0 0 0 3 3h7.5" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="17" y="31" text-anchor="middle" font-family="system-ui, sans-serif" font-size="8.5" font-weight="700" fill="currentColor">PDF</text></svg>
+          <div class="pdf-id">
+            <h2 class="pdf-title" id="pdf-title"></h2>
+            <p class="pdf-meta" id="pdf-meta"></p>
+          </div>
+        </div>
+        <ul class="chips" id="pdf-chips" aria-label="What the PDF contains"></ul>
+        <form id="pdf-form" novalidate>
+          <fieldset class="methods" id="pdf-methods">
+            <legend class="field-label">How to read it</legend>
+          </fieldset>
+        </form>
+      </section>
+
+      <div class="options">
+        <label class="check"><input type="checkbox" id="include-appendix"> Include appendix</label>
+        <label class="check">LLM clean-up <select id="llm-runner" aria-describedby="llm-note"></select></label>
+        <p class="option-note muted" id="llm-note" hidden></p>
+      </div>
+
+      <p class="pdf-total" id="pdf-total" aria-live="polite" hidden></p>
+      <div class="pdf-actions" id="pdf-actions" hidden>
+        <button class="btn primary" type="submit" form="pdf-form" id="pdf-continue">Continue</button>
+        <button class="btn quiet" type="button" id="pdf-reset">Choose another file</button>
+      </div>
+
+      <div class="progress" id="ingest-progress" hidden>
+        <progress max="1" value="0"></progress>
+        <p class="msg"></p>
+      </div>
+      <p class="error" id="ingest-error" role="alert" hidden></p>
+    </div>
+
+    <section class="library" aria-labelledby="library-title">
+      <h2 id="library-title">Library</h2>
+      <ul id="library"></ul>
+      <p class="muted" id="library-empty" hidden></p>
+    </section>
+  </main>
+</body>
+</html>

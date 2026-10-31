@@ -1,0 +1,51 @@
+[project]
+name = "paper-reader"
+version = "0.1.0"
+description = "arXiv link -> clean two-pane HTML reader with figures/equations -> priced, accepted TTS narration"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "anthropic",
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "beautifulsoup4",
+    "lxml",
+    "pydantic>=2",
+    "numpy",
+    "soundfile",
+    "kokoro>=0.9.4",
+    "qwen-tts",
+    "torch",
+    "torchaudio",
+    "pymupdf",
+    "python-multipart",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+
+[project.scripts]
+paper-reader = "paper_reader.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["paper_reader"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
