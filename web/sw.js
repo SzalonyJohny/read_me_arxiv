@@ -9,7 +9,7 @@
 //    no job polling).
 // Every response made without the server carries OFFLINE_HEADER, so pages can switch to offline mode.
 
-const SHELL_CACHE = "shell-v11"; // bump to re-cache the shell (old versions are deleted on activate)
+const SHELL_CACHE = "shell-v12"; // bump to re-cache the shell (old versions are deleted on activate)
 const SHELL_PREFIX = "shell-";
 const PAPER_PREFIX = "paper-"; // the cache names and index below are shared with web/offline.js
 const INDEX_CACHE = "offline-index";

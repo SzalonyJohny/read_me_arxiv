@@ -81,6 +81,7 @@ body.reader {
 
 .menu-panel {
   position: absolute;
+  z-index: 10; /* above the player row's seek bar, which comes later in the page */
   top: calc(100% + 6px);
   left: 0;
   width: min(460px, calc(100vw - 2rem));
