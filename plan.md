@@ -44,6 +44,25 @@ arXiv link ──► fetch arXiv HTML ──► paper.json ──► text filter
 
 The LLM must not summarise or paraphrase. It reads the paper, it doesn't retell it.
 
+### Reading equations by meaning (option)
+
+With `equations="meaning"` (the default: the "Read equations by meaning" checkbox, `--equations meaning`), the LLM reads defined symbols by their meaning: "the reward at time step t equals the imitation weight times the imitation objective …" instead of "r t equals omega to the I times r t to the I …". This only works with an LLM runner, and the meaning is never guessed:
+
+1. **Definitions** (`definitions.py`). For each equation, and each paragraph containing maths, the paper's sentences that define its symbols are found deterministically and sent with it:
+   - definition cues ("where", "denotes", "represents", "is the", "weights", …) and appositions ("the center-of-mass reward $r^{c}_{t}$");
+   - symbols compared as (base, superscript, subscript), with rare symbols weighted above common ones (s_t, a_t);
+   - coverage first, so every symbol of a long equation gets its own definition.
+2. **Prompt.** A second, byte-stable prompt variant with six worked examples (weighted sum, expectation, fraction, an undefined symbol that keeps its name, indices, inline maths). The examples use their own symbols (λ₁, λ₂), so a paper's `w^e` can't inherit a meaning from an example.
+3. **Grounding check.** Every content word the model adds must occur in the paper, in ordinary maths language, or among the spoken units. On DeepMimic this check caught "energy weight" for `w^e`, which that paper defines as the end-effector weight.
+4. **Consistency check.** The model reports the name it gave each symbol, and the most-used name becomes canonical.
+   - A block fails if it reported a different name, or if a display equation's reading doesn't contain the name's words (in any order).
+   - Failing blocks are asked once more with the canonical names. What still disagrees is listed as a warning.
+   - The glossary of symbol names appears in the reader's "About this text" box.
+
+On DeepMimic (1804.02717) this gave 52 symbols, 11 blocks re-asked and 0 inconsistencies left, at about 60 s with Codex.
+
+**Symbols inside sentences** are a separate option (`inline`, the second checkbox, `--inline`), so there are four prompt variants: equations × sentences, each by symbols or by meaning. When the words right before a symbol already name it ("the slip penalty $\kappa_t$"), the symbol is dropped. A symbol standing alone is read by its meaning. In the sentence that defines a symbol ("$u_t$ denotes …", "with $u_t$ being …") the letters stay; otherwise the definition becomes "X denotes X". On DeepMimic, "Finally, $r_t^c$ penalizes deviations in the character's center-of-mass $p_t^c$" now reads "Finally, the center-of-mass reward penalizes deviations in the character's center-of-mass".
+
 ## Price model (per paper, ~40k spoken characters ≈ 40 min)
 
 | Step | Cost |
@@ -88,7 +107,7 @@ data/samples/      voice samples
 | GET | `/papers/{paper_id}/…` | files: `paper.json`, `figures/*`, `audio/<run>/*` |
 | GET | `/api/config` | `{cleanup_runners: [{id, label, available, reason}], default_cleanup}` |
 | GET | `/api/papers` | `[{paper_id, arxiv_id, title, audio_runs: [run_id]}]` |
-| POST | `/api/papers/{paper_id}/cleanup` | `{llm: haiku/codex/none}` → `{job_id}`; re-runs the clean-up of an ingested paper |
+| POST | `/api/papers/{paper_id}/cleanup` | `{llm: haiku/codex/none, equations: symbols/meaning, inline: symbols/meaning}` → `{job_id}`; re-runs the clean-up of an ingested paper |
 | POST | `/api/papers` | `{url, include_appendix=false, llm: haiku/codex/none (default: the first available)}` → `{job_id, arxiv_id}`; the job result has `paper_id` (the version is only known after the fetch) |
 | GET | `/api/jobs/{job_id}` | `{job_id, kind, status: queued/running/done/error, progress 0–1, message, result, error}` |
 | GET | `/api/papers/{paper_id}/estimate` | `Estimate` |

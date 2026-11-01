@@ -17,6 +17,10 @@ Everything runs locally on your machine. Paid services are optional, and nothing
   - First a rule-based filter removes citation markers and expands "Fig."/"Eq."/"e.g.". It also reads units and simple maths aloud.
   - Then an optional LLM pass reads equations aloud and repairs sentences that the citation removal broke. It can use Claude Haiku 5.5 (Anthropic API) or Codex (`gpt-6-luna`, through your ChatGPT plan).
   - A guard keeps the rule-based text wherever the LLM paraphrases too much.
+  - **Read equations by meaning** (checkbox, on by default): with an LLM clean-up, maths can be read by what the paper defines the symbols as. For example, "r t equals omega I r t I plus omega G r t G" becomes "the reward at time step t equals the imitation weight times the imitation objective plus the task weight times the task objective".
+    - The meanings come only from the paper's own definition sentences, which are found automatically and sent with each equation.
+    - A grounding check rejects any word the paper doesn't use, and a consistency check makes sure a symbol gets the same name in every equation.
+  - **Read symbols in the text by meaning** (second checkbox, on by default): the same for maths inside sentences. For example, "the center-of-mass reward r t to the c penalizes…" becomes "the center-of-mass reward penalizes…", and a symbol on its own is read by its meaning. The sentence that defines a symbol keeps its letters, so the definition still says something.
 - **Narration**
   - **Kokoro-82M**: local, about 100× realtime on a GPU.
   - **Qwen3-TTS**: local. Voices are designed from a text description, such as "Clear and precise and technical, male middle age man". Sentences are batched, so a 30-minute paper renders in about 2 minutes.
@@ -80,6 +84,7 @@ The web app and the CLI run the same pipeline:
 ```bash
 uv run paper-reader ingest https://arxiv.org/pdf/2601.17428 [--appendix] [--llm auto|haiku|codex|none]
 uv run paper-reader cleanup 2601.17428v1 --llm codex          # re-run the clean-up
+uv run paper-reader cleanup 1804.02717v3 --llm codex --equations symbols --inline symbols   # read maths symbol by symbol instead
 uv run paper-reader estimate 2601.17428v1                     # characters, minutes, cost per engine
 uv run paper-reader voices --engine kokoro
 uv run paper-reader samples --paper 2601.17428v1 --abstract --voices all          # compare every Kokoro voice
@@ -118,6 +123,7 @@ paper_reader/
   arxiv.py, parse_html.py      arXiv link → LaTeXML HTML → Paper
   pdf/                 analyze.py, text_layer.py, ocr.py (DeepSeek-OCR 2 worker), assemble.py, ingest.py
   textfilter.py        rule-based speech text (LaTeX → words, citations, abbreviations, units)
+  definitions.py       finds where a paper defines its symbols (for reading equations by meaning)
   cleanup.py           Claude Haiku 5.5 pass with few-shot examples and the rewrite guard
   cleanup_codex.py     the same pass through `codex exec`
   pricing.py           estimates for clean-up and every TTS option

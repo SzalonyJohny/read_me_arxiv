@@ -13,6 +13,7 @@ from anthropic.types import Message, TextBlock, ThinkingBlock, Usage
 
 from paper_reader import cleanup
 from paper_reader.cleanup import SYSTEM_PROMPT, cleanup_paper, guard_accepts, llm_available, plan_requests
+from paper_reader.definitions import paper_vocabulary
 from paper_reader.models import Block, Paper, Section
 from paper_reader.textfilter import apply_filter, equation_speech, filter_text
 
@@ -279,19 +280,54 @@ def test_guard_for_equations():
     assert not guard_accepts(block, r"Equation 4: \mathcal{L} = a + b")
 
 
-def test_few_shot_examples_pass_the_guard_and_match_the_filter():
-    for example in cleanup._EXAMPLES:
-        if example.eq_number:
+def _vocabulary(*texts: str) -> set[str]:
+    """What paper_vocabulary would give for a paper made of these texts."""
+    blocks = [Block(id=f"v{i}", type="paragraph", text=t) for i, t in enumerate(texts)]
+    return paper_vocabulary(Paper(paper_id="v", arxiv_id="v", title="", source_url="x",
+                                  sections=[Section(id="S1", title="", blocks=blocks)]))
+
+
+READINGS = [(mode, inline) for mode in cleanup.EQUATION_MODES for inline in cleanup.EQUATION_MODES]
+
+
+@pytest.mark.parametrize(("mode", "inline"), READINGS)
+def test_few_shot_examples_pass_the_guard_and_match_the_filter(mode, inline):
+    for example in cleanup.examples_for(mode, inline):
+        if example.eq_number or example.is_equation:
             block = Block(id="x", type="equation", latex=example.source, eq_number=example.eq_number)
             block.speech = equation_speech(block)
         else:
             block = _paragraph(example.source)
-        assert guard_accepts(block, example.speech), example.title
-        assert json.dumps(block.speech, ensure_ascii=False) in SYSTEM_PROMPT  # the prompt shows real filter output
+        # meaning mode: every added word must come from the example's own context and definitions
+        vocabulary = _vocabulary(example.source, example.context, example.context_after, *example.definitions)
+        assert guard_accepts(block, example.speech, mode=mode, inline=inline, vocabulary=vocabulary), example.title
+        # the prompt shows the real filter output
+        assert json.dumps(block.speech, ensure_ascii=False) in cleanup.system_prompt(mode, inline)
+
+
+def test_meaning_prompts_cover_each_part_separately():
+    both = cleanup.system_prompt("meaning")  # inline follows the equations setting by default
+    assert both == cleanup.system_prompt("meaning", "meaning") and both.startswith(cleanup._JOB)
+    assert cleanup._MEANING_EQUATIONS in both and cleanup._MEANING_INLINE in both
+    assert '"definitions"' in both and "Never guess a meaning" in both
+    assert "a t equals pi theta of o t" not in both  # symbol-by-symbol equation examples left out
+
+    equations_only = cleanup.system_prompt("meaning", "symbols")
+    assert cleanup._MEANING_EQUATIONS in equations_only and cleanup._SYMBOLS_INLINE in equations_only
+    assert "slip penalty" not in equations_only  # the sentence examples belong to inline meaning
+
+    text_only = cleanup.system_prompt("symbols", "meaning")
+    assert cleanup._MEANING_INLINE in text_only and cleanup._SYMBOLS_EQUATIONS in text_only
+    assert "The slip penalty discourages foot sliding" in text_only  # the symbol after its name is dropped
+    assert "a t equals pi theta of o t" in text_only  # equations stay symbol by symbol
+
+    assert cleanup.system_prompt("symbols", "symbols") == cleanup.SYSTEM_PROMPT
+    with pytest.raises(ValueError):
+        cleanup.system_prompt("letters")
 
 
 def test_system_prompt_is_stable_and_covers_the_rules():
-    assert cleanup._build_system_prompt() == SYSTEM_PROMPT
+    assert cleanup._build_system_prompt("symbols") == SYSTEM_PROMPT
     assert 12 <= SYSTEM_PROMPT.count("\nInput: ") <= 16
     assert len(SYSTEM_PROMPT) / 4 > 512  # above Haiku 5.5's minimum cacheable prefix, even at 4 chars/token
     sources = " ".join(e.source for e in cleanup._EXAMPLES)

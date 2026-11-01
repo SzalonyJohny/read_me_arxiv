@@ -81,6 +81,13 @@ class CleanupStats(BaseModel):
     blocks_llm: int = 0
     blocks_rejected: int = 0  # LLM output rejected by the rewrite guard -> filter text kept
     skipped_reason: str | None = None  # e.g. "no ANTHROPIC_API_KEY"
+    equation_mode: Literal["symbols", "meaning"] = "symbols"  # display equations: symbol by symbol, or by meaning
+    inline_mode: Literal["symbols", "meaning"] = "symbols"  # symbols inside sentences: the same choice
+    # Meaning mode: the name each symbol is read as (LaTeX -> name), the same in every equation,
+    # and what still disagrees after the repair pass (empty = consistent).
+    symbol_names: dict[str, str] = Field(default_factory=dict)
+    inconsistent_symbols: list[str] = Field(default_factory=list)
+    symbols_repaired: int = 0  # blocks re-asked because they named a symbol differently
 
 
 class Paper(BaseModel):

@@ -1,7 +1,7 @@
 // Reader page: the paper on the left, the most recently mentioned figure on the right,
 // and (when a narration run exists) an audio player that highlights and follows the text.
 
-import { api, connection, fmt, h, store } from "/static/common.js";
+import { api, connection, fmt, h, pollJob, showProgress, store } from "/static/common.js";
 import { initListen } from "/static/listen.js";
 import { initMediaSession, setNowPlaying } from "/static/media-session.js";
 import { registerServiceWorker } from "/static/offline.js";
@@ -241,7 +241,76 @@ function renderAbout(paper) {
     h("summary", {}, "About this text",
       warnings.length > 0 && h("span", { class: "badge warn", text: `${warnings.length} warning${warnings.length > 1 ? "s" : ""}` })),
     h("dl", {}, rows.flatMap(([term, value]) => [h("dt", { text: term }), h("dd", { text: value })])),
-    warnings.length > 0 && h("ul", { class: "warnings" }, warnings.map((w) => h("li", { text: w }))));
+    warnings.length > 0 && h("ul", { class: "warnings" }, warnings.map((w) => h("li", { text: w }))),
+    renderSymbolNames(paper.cleanup),
+    renderRecleanup(paper));
+}
+
+// Meaning mode: what each symbol is read as (the same name in every equation), rendered with KaTeX.
+function renderSymbolNames(cleanup) {
+  const names = Object.entries(cleanup?.symbol_names ?? {});
+  const byMeaning = cleanup?.equation_mode === "meaning" || cleanup?.inline_mode === "meaning";
+  if (!byMeaning || names.length === 0) return null;
+  return h("details", { class: "symbol-names" },
+    h("summary", { text: `Symbol names (${names.length})` }),
+    h("dl", {}, names.flatMap(([latex, name]) => [
+      h("dt", { text: `\\(${latex}\\)` }),
+      h("dd", { text: name }),
+    ])));
+}
+
+// Re-run the clean-up of this paper, e.g. to read equations by meaning. Needs the server, so it
+// stays hidden offline; the page reloads with the new text when the job is done.
+function renderRecleanup(paper) {
+  const select = h("select", { "aria-label": "LLM clean-up runner" });
+  const meaning = h("input", { type: "checkbox", checked: true }); // reading by meaning is the default
+  const inlineMeaning = h("input", { type: "checkbox", checked: true });
+  const run = h("button", { class: "btn", type: "button", text: "Re-run clean-up" });
+  const progress = h("div", { class: "progress", hidden: true }, h("progress", { max: 1, value: 0 }), h("p", { class: "msg" }));
+  const status = h("p", { class: "muted recleanup-note",
+    text: "This changes the narration text. Generate the narration again to hear it; unchanged paragraphs come from the cache." });
+  const box = h("div", { class: "recleanup", hidden: true },
+    h("label", {}, "LLM ", select),
+    h("label", { class: "check" }, meaning, " Read equations by meaning"),
+    h("label", { class: "check" }, inlineMeaning, " Read symbols in the text by meaning"),
+    run, progress, status);
+  const sync = () => {
+    meaning.disabled = inlineMeaning.disabled = select.value === "none"; // only an LLM can read by meaning
+  };
+  api("/api/config").then((config) => {
+    const runners = [...config.cleanup_runners, { id: "none", label: "Off: rule-based filter only", available: true }];
+    for (const r of runners) {
+      select.append(h("option", { value: r.id, disabled: !r.available, text: r.available ? r.label : `${r.label}: unavailable` }));
+    }
+    select.value = config.default_cleanup || "none";
+    sync();
+    box.hidden = connection.offline;
+  }).catch(() => { box.hidden = true; });
+  select.addEventListener("change", sync);
+  run.addEventListener("click", async () => {
+    for (const el of [select, meaning, inlineMeaning, run]) el.disabled = true;
+    try {
+      const { job_id: jobId } = await api(`/api/papers/${encodeURIComponent(paperId)}/cleanup`, {
+        method: "POST", body: { llm: select.value, equations: meaning.checked ? "meaning" : "symbols",
+                                inline: inlineMeaning.checked ? "meaning" : "symbols" } });
+      await pollJob(jobId, (job) => showProgress(progress, job));
+      location.reload();
+    } catch (err) {
+      status.textContent = `Clean-up failed: ${err.message}`;
+      for (const el of [select, run]) el.disabled = false;
+      sync();
+    }
+  });
+  return box;
+}
+
+function symbolSummary(cleanup) {
+  const named = Object.keys(cleanup.symbol_names ?? {}).length;
+  const open = (cleanup.inconsistent_symbols ?? []).length;
+  const parts = [`${named} named, each read the same way everywhere`];
+  if (cleanup.symbols_repaired) parts.push(`${cleanup.symbols_repaired} blocks re-asked to match`);
+  if (open) parts[0] = `${named} named; ${open} still read inconsistently (see warnings)`;
+  return parts.join(" · ");
 }
 
 function cleanupRows(cleanup) {
@@ -251,6 +320,9 @@ function cleanupRows(cleanup) {
     ["LLM clean-up", cleanup.model ?? "–"],
     ["Cost", `${fmt.usd(cleanup.cost_usd)} · ${fmt.int(cleanup.input_tokens)} tokens in, ${fmt.int(cleanup.output_tokens)} out`],
     ["Blocks", `${cleanup.blocks_llm} cleaned, ${cleanup.blocks_rejected} rejected by the rewrite guard (rule text kept)`],
+    ["Equations", cleanup.equation_mode === "meaning" ? "read by meaning (from the paper's definitions)" : "read symbol by symbol"],
+    ["Symbols in the text", cleanup.inline_mode === "meaning" ? "read by meaning" : "read symbol by symbol"],
+    ...("meaning" === cleanup.equation_mode || "meaning" === cleanup.inline_mode ? [["Symbols", symbolSummary(cleanup)]] : []),
   ];
 }
 
@@ -288,7 +360,19 @@ function renderBlock(block) {
   el.id = block.id;
   el.classList.add("blk", `blk-${block.type}`);
   if (block.speak && block.speech) el.append(speechBox(block.speech, block.speech_source));
+  if (block.type === "equation" && block.speak && block.speech) {
+    // Click (or Enter) shows how the equation is read aloud, in small text under it.
+    el.classList.add("has-reading");
+    el.tabIndex = 0;
+    el.title = "Show how this equation is read aloud";
+    el.setAttribute("aria-expanded", "false");
+  }
   return el;
+}
+
+function toggleReading(equation) {
+  const open = equation.classList.toggle("show-reading");
+  equation.setAttribute("aria-expanded", String(open));
 }
 
 function renderHtml(block) {
@@ -799,6 +883,11 @@ function onPaneClick(event) {
     pinFigure(chip.dataset.fig);
     return;
   }
+  const equation = event.target.closest(".blk-equation.has-reading");
+  if (equation && !hasSelection()) {
+    toggleReading(equation); // equations show their spoken text; paragraphs seek the narration
+    return;
+  }
   if (!state.run || event.target.closest("a, button, summary, .about") || hasSelection()) return;
   const unit = event.target.closest(".seekable");
   const i = unit ? state.unitFirstSeg.get(unit.id) : undefined;
@@ -840,7 +929,10 @@ function onTocClick(event) {
 
 function onKeyDown(event) {
   if (isTextEntry(event.target) || event.target.closest("dialog")) return;
-  if (event.key === " " && state.run) {
+  if (event.key === "Enter" && event.target.matches?.(".blk-equation.has-reading")) {
+    event.preventDefault();
+    toggleReading(event.target);
+  } else if (event.key === " " && state.run) {
     event.preventDefault();
     togglePlay();
   } else if (NAV_KEYS.has(event.key)) {

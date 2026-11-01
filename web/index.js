@@ -2,8 +2,8 @@
 // time estimate per extraction method → Continue → ingest job → reader; plus the library list
 // (offline: only the papers saved on this device, and no adding).
 
-import { api, connection, fmt, h, pollJob, showProgress } from "/static/common.js";
-import { listSaved, registerServiceWorker } from "/static/offline.js";
+import { api, connection, fmt, h, pollJob, showProgress, store } from "/static/common.js";
+import { listSaved, registerServiceWorker, removePaper } from "/static/offline.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = {
@@ -13,6 +13,8 @@ const ui = {
   submit: $("submit"),
   appendix: $("include-appendix"),
   llm: $("llm-runner"),
+  meaning: $("equations-meaning"),
+  inlineMeaning: $("inline-meaning"),
   llmNote: $("llm-note"),
   progress: $("ingest-progress"),
   error: $("ingest-error"),
@@ -67,7 +69,21 @@ async function loadConfig() {
     runnerNotes.set(runner.id, runner.available ? "" : runner.reason || "not configured");
   }
   ui.llm.value = config.default_cleanup || RULES_ONLY.id;
+  syncMeaning();
   showRunnerNote();
+}
+
+// Reading maths by meaning needs an LLM: the rule-based filter can only read symbols.
+function equationMode() {
+  return ui.meaning.checked && !ui.meaning.disabled ? "meaning" : "symbols";
+}
+
+function inlineMode() {
+  return ui.inlineMeaning.checked && !ui.inlineMeaning.disabled ? "meaning" : "symbols";
+}
+
+function syncMeaning(busy = false) {
+  ui.meaning.disabled = ui.inlineMeaning.disabled = busy || ui.llm.value === RULES_ONLY.id;
 }
 
 function showRunnerNote() {
@@ -94,14 +110,55 @@ async function loadLibrary() {
 
 function libraryItem(paper, saved) {
   const runs = paper.audio_runs?.length ?? 0;
-  return h("li", {},
+  const title = paper.title || paper.paper_id;
+  const remove = h("button", { class: "lib-delete", type: "button", title: "Delete from the library",
+                               "aria-label": `Delete “${title}” from the library` }, trashIcon());
+  remove.hidden = connection.offline; // deleting needs the server
+  const item = h("li", {},
     h("a", { href: `/reader/${encodeURIComponent(paper.paper_id)}` },
       h("span", { class: "lib-text" },
-        h("span", { class: "lib-title", text: paper.title || paper.paper_id }),
+        h("span", { class: "lib-title", text: title }),
         h("span", { class: "lib-meta", text: sourceLabel(paper) })),
       h("span", { class: "lib-badges" },
         runs > 0 && h("span", { class: "badge", title: paper.audio_runs.join("\n"), text: runs > 1 ? `Audio · ${runs}` : "Audio" }),
-        saved && h("span", { class: "badge saved", title: "Readable and playable without a connection", text: "Saved offline" }))));
+        saved && h("span", { class: "badge saved", title: "Readable and playable without a connection", text: "Saved offline" }))),
+    remove);
+  remove.addEventListener("click", () => deletePaper(paper, saved, item, remove));
+  return item;
+}
+
+/** Remove a paper (server copy, and the offline copy on this device if there is one). */
+async function deletePaper(paper, saved, item, button) {
+  const title = paper.title || paper.paper_id;
+  const offlineCopy = saved ? " and its offline copy on this device" : "";
+  const question = `Delete “${title}” from the library?\n\nThis removes its text, figures and narrations` +
+    ` from the server${offlineCopy}. It can't be undone.`;
+  if (!window.confirm(question)) return;
+  button.disabled = true;
+  try {
+    await api(`/api/papers/${encodeURIComponent(paper.paper_id)}`, { method: "DELETE" });
+    if (saved) await removePaper(paper.paper_id).catch(() => {}); // the server copy is gone either way
+    item.remove();
+    if (ui.library.children.length === 0) {
+      ui.libraryEmpty.textContent = NO_PAPERS;
+      ui.libraryEmpty.hidden = false;
+    }
+  } catch (err) {
+    const meta = item.querySelector(".lib-meta");
+    meta.textContent = `Could not delete: ${err.message}`;
+    meta.classList.add("lib-error");
+    button.disabled = false;
+  }
+}
+
+function trashIcon() {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6");
+  svg.append(path);
+  return svg;
 }
 
 /** "arXiv 2601.17428v1", or for uploads "PDF · paper.pdf" (+ " · OCR" when DeepSeek-OCR read it). */
@@ -138,6 +195,7 @@ function canUpload() {
 function setBusy(value) {
   busy = value;
   for (const el of [ui.url, ui.submit, ui.appendix, ui.llm, ui.pick, ui.continue, ui.reset]) el.disabled = value;
+  syncMeaning(value);
   ui.methods.disabled = value;
   if (!value) updateTotal();
 }
@@ -178,7 +236,7 @@ function ingestUrl(event) {
   }
   runIngest("Submitting", () => api("/api/papers", {
     method: "POST",
-    body: { url, include_appendix: ui.appendix.checked, llm: ui.llm.value },
+    body: { url, include_appendix: ui.appendix.checked, llm: ui.llm.value, equations: equationMode(), inline: inlineMode() },
   }));
 }
 
@@ -353,7 +411,8 @@ function ingestPdf(event) {
   if (!analysis || !chosen || busy) return;
   runIngest("Starting", () => api(`/api/pdf/${encodeURIComponent(analysis.upload_id)}/ingest`, {
     method: "POST",
-    body: { method: chosen.method, include_appendix: ui.appendix.checked, llm: ui.llm.value },
+    body: { method: chosen.method, include_appendix: ui.appendix.checked, llm: ui.llm.value,
+            equations: equationMode(), inline: inlineMode() },
   }), (err) => (err.status === 404
     ? `The server no longer has this upload (${err.message}). Choose the file again.`
     : err.message));
@@ -365,7 +424,14 @@ ui.form.addEventListener("submit", ingestUrl);
 ui.llm.addEventListener("change", () => {
   showRunnerNote();
   updateTotal();
+  syncMeaning();
 });
+// On by default; unticking it is remembered. ("equation-mode" replaces the old "equations" key, so an
+// earlier "off" from before meaning became the default doesn't stick.)
+ui.meaning.checked = store.get("equation-mode", "meaning") === "meaning";
+ui.meaning.addEventListener("change", () => store.set("equation-mode", ui.meaning.checked ? "meaning" : "symbols"));
+ui.inlineMeaning.checked = store.get("inline-mode", "meaning") === "meaning";
+ui.inlineMeaning.addEventListener("change", () => store.set("inline-mode", ui.inlineMeaning.checked ? "meaning" : "symbols"));
 ui.pick.addEventListener("click", () => ui.file.click());
 ui.file.addEventListener("change", () => {
   const file = ui.file.files[0];

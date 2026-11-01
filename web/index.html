@@ -418,15 +418,57 @@
       border-top: 1px solid var(--border);
     }
 
+    .library li {
+      display: flex;
+      align-items: center;
+      gap: 0.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+
     .library li a {
       display: flex;
+      flex: 1;
+      min-width: 0;
       align-items: baseline;
       gap: 1rem;
       padding: 0.85rem 0.25rem;
-      border-bottom: 1px solid var(--border);
       color: inherit;
       text-decoration: none;
     }
+
+    .lib-delete {
+      flex: none;
+      display: grid;
+      place-items: center;
+      width: 2.25rem;
+      height: 2.25rem;
+      padding: 0;
+      border: 0;
+      border-radius: 8px;
+      background: none;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .lib-delete svg {
+      width: 1.1rem;
+      height: 1.1rem;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .lib-delete:hover:not(:disabled),
+    .lib-delete:focus-visible {
+      color: var(--danger);
+      background: var(--danger-soft);
+    }
+
+    .lib-delete:disabled { opacity: 0.5; cursor: progress; }
+
+    .lib-error { color: var(--danger); }
 
     .library li a:hover .lib-title {
       color: var(--accent);
@@ -569,6 +611,10 @@
       <div class="options">
         <label class="check"><input type="checkbox" id="include-appendix"> Include appendix</label>
         <label class="check">LLM clean-up <select id="llm-runner" aria-describedby="llm-note"></select></label>
+        <label class="check" title="Read maths by what the paper defines the symbols as: &quot;the reward at time step t equals the imitation weight times …&quot; instead of &quot;r t equals omega I …&quot;. Needs an LLM clean-up.">
+          <input type="checkbox" id="equations-meaning" checked> Read equations by meaning</label>
+        <label class="check" title="Read symbols inside sentences by what they mean: &quot;the center-of-mass reward r t to the c&quot; becomes &quot;the center-of-mass reward&quot;. Needs an LLM clean-up.">
+          <input type="checkbox" id="inline-meaning" checked> Read symbols in the text by meaning</label>
         <p class="option-note muted" id="llm-note" hidden></p>
       </div>
 

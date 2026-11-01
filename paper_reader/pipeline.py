@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -99,6 +100,24 @@ def list_audio_runs(paper_id: str) -> list[AudioManifest]:
     audio_root = paper_dir(paper_id) / "audio"
     manifests = sorted(audio_root.glob("*/manifest.json"), key=lambda p: p.stat().st_mtime)
     return [AudioManifest.model_validate_json(p.read_text(encoding="utf-8")) for p in manifests]
+
+
+def delete_paper(paper_id: str) -> dict:
+    """Remove everything stored for one paper: its folder (text, figures, narrations, source PDF,
+    clean-up exports), its voice-lab and sample clips and, for an uploaded PDF, the upload. The
+    shared TTS clip cache stays: clips are keyed by their text and may serve other papers."""
+    folder = paper_dir(paper_id)
+    if not (folder / "paper.json").exists():
+        raise FileNotFoundError(f"no paper {paper_id!r}")
+    targets = [folder, SAMPLES_DIR / folder.name]
+    if paper_id.startswith("pdf-"):  # pdf-<first 12 hex of the upload id>
+        targets += sorted((DATA_ROOT / "uploads").glob(f"{paper_id[4:]}*"))
+    targets = [t for t in targets if t.is_dir()]
+    freed = sum(f.stat().st_size for t in targets for f in t.rglob("*") if f.is_file())
+    for target in targets:
+        shutil.rmtree(target)
+    return {"paper_id": paper_id, "deleted": [t.relative_to(DATA_ROOT).as_posix() for t in targets],
+            "freed_bytes": freed}
 
 
 def offline_files(paper_id: str, run_id: str | None = None) -> dict:
@@ -248,9 +267,13 @@ def default_cleanup_runner() -> str | None:
     return next((r["id"] for r in cleanup_runners() if r["available"]), None)
 
 
-def run_cleanup(paper: Paper, llm: str | None, *, model: str | None = None, progress: Progress = _noop) -> Paper:
+def run_cleanup(paper: Paper, llm: str | None, *, model: str | None = None, equations: str = "meaning",
+                inline: str = "meaning", progress: Progress = _noop) -> Paper:
     """Rule filter, then the chosen LLM pass ("haiku", "codex" or None; `model` overrides the
-    runner's default model, e.g. "gpt-5.6-luna" for Codex). Saves the paper."""
+    runner's default model, e.g. "gpt-5.6-luna" for Codex). equations="meaning" makes the LLM read
+    symbols by what the paper defines them as ("the imitation weight" instead of "omega I"); the
+    rule-based text can't do that, so it only applies with an LLM runner. inline does the same for
+    symbols inside sentences ("the center-of-mass reward $r^c_t$" -> "the center-of-mass reward"). Saves the paper."""
     from .cleanup import cleanup_paper
     from .cleanup_codex import cleanup_paper_codex
     from .textfilter import apply_filter
@@ -267,14 +290,15 @@ def run_cleanup(paper: Paper, llm: str | None, *, model: str | None = None, prog
     else:
         progress(0.0, f"LLM clean-up: {runner['label']}")
         run = cleanup_paper_codex if llm == "codex" else cleanup_paper
-        paper.cleanup = run(paper, progress_cb=progress, **({"model": model} if model else {}))
+        paper.cleanup = run(paper, progress_cb=progress, equations=equations, inline=inline,
+                            **({"model": model} if model else {}))
     save_paper(paper)
     estimate(paper.paper_id, paper=paper)
     return paper
 
 
 def ingest(url: str, *, include_appendix: bool = False, llm: str | None = "haiku", model: str | None = None,
-           progress: Progress = _noop) -> Paper:
+           equations: str = "meaning", inline: str = "meaning", progress: Progress = _noop) -> Paper:
     """Fetch + parse an arXiv paper, then clean it up (see run_cleanup)."""
     from .arxiv import ingest_arxiv
 
@@ -282,7 +306,8 @@ def ingest(url: str, *, include_appendix: bool = False, llm: str | None = "haiku
     paper = ingest_arxiv(url, PAPERS_DIR, include_appendix=include_appendix,
                          progress_cb=scaled_progress(progress, 0.0, 0.4))
     progress(0.4, "Rule-based text filter")
-    run_cleanup(paper, llm, model=model, progress=scaled_progress(progress, 0.42, 0.98))
+    run_cleanup(paper, llm, model=model, equations=equations, inline=inline,
+                progress=scaled_progress(progress, 0.42, 0.98))
     progress(1.0, "Done")
     return paper
 

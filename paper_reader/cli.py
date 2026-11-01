@@ -2,8 +2,9 @@
 
     paper-reader serve [--host 127.0.0.1] [--port 8000]
     paper-reader ingest URL [--appendix] [--llm auto|haiku|codex|none] [--llm-model M]
-    paper-reader cleanup PAPER_ID [--llm auto|haiku|codex|none]   (re-run the clean-up)
+    paper-reader cleanup PAPER_ID [--llm auto|haiku|codex|none] [--equations symbols|meaning]   (re-run the clean-up)
     paper-reader estimate PAPER_ID
+    paper-reader delete PAPER_ID [--yes]
     paper-reader cleanup-export PAPER_ID [--parts 4]   (LLM clean-up by an external runner)
     paper-reader cleanup-import PAPER_ID answers.json...
     paper-reader voices [--engine kokoro]
@@ -50,7 +51,7 @@ def _print_cleanup(paper) -> None:
 
 def cmd_ingest(args) -> None:
     paper = pipeline.ingest(args.url, include_appendix=args.appendix, llm=_llm_choice(args.llm),
-                            model=args.llm_model, progress=_progress)
+                            model=args.llm_model, equations=args.equations, inline=args.inline, progress=_progress)
     _done()
     blocks = list(paper.iter_blocks())
     print(f"{paper.paper_id}: {paper.title}")
@@ -61,7 +62,7 @@ def cmd_ingest(args) -> None:
 
 def cmd_cleanup(args) -> None:
     paper = pipeline.run_cleanup(pipeline.load_paper(args.paper_id), _llm_choice(args.llm), model=args.llm_model,
-                                 progress=_progress)
+                                 equations=args.equations, inline=args.inline, progress=_progress)
     _done()
     print(f"{paper.paper_id}: {paper.title}")
     _print_cleanup(paper)
@@ -131,18 +132,20 @@ def cmd_tts(args) -> None:
 
 
 def cmd_cleanup_export(args) -> None:
-    from .cleanup import SYSTEM_PROMPT, export_requests
+    from .cleanup import export_requests, system_prompt
 
     paper = pipeline.load_paper(args.paper_id)
     out = Path(args.out) if args.out else pipeline.paper_dir(args.paper_id) / "llm"
     out.mkdir(parents=True, exist_ok=True)
-    (out / "system_prompt.md").write_text(SYSTEM_PROMPT, encoding="utf-8")
-    for k, group in enumerate(export_requests(paper, args.parts), 1):
+    prompt = system_prompt(args.equations, args.inline)
+    (out / "system_prompt.md").write_text(prompt, encoding="utf-8")
+    for k, group in enumerate(export_requests(paper, args.parts, args.equations, args.inline), 1):
         path = out / f"part_{k}.json"
         path.write_text(json.dumps(group, ensure_ascii=False, indent=1), encoding="utf-8")
         blocks = sum(len(r["block_ids"]) for r in group)
         print(f"{path}: {len(group)} requests, {blocks} blocks")
-    print(f"{out / 'system_prompt.md'}: the instructions + worked examples ({len(SYSTEM_PROMPT):,} chars)")
+    print(f"{out / 'system_prompt.md'}: the instructions + worked examples ({len(prompt):,} chars, "
+          f"equations read by {args.equations}, symbols in the text by {args.inline})")
 
 
 def cmd_cleanup_import(args) -> None:
@@ -153,7 +156,7 @@ def cmd_cleanup_import(args) -> None:
     for name in args.files:
         data = json.loads(Path(name).read_text(encoding="utf-8"))
         answers += data["blocks"] if isinstance(data, dict) else data
-    stats = import_answers(paper, answers, model=args.model)
+    stats = import_answers(paper, answers, model=args.model, mode=args.equations, inline=args.inline)
     pipeline.save_paper(paper)
     pipeline.estimate(paper.paper_id, paper=paper)
     print(f"{paper.paper_id}: {stats.blocks_llm} blocks from {args.model}, "
@@ -161,6 +164,16 @@ def cmd_cleanup_import(args) -> None:
     for w in paper.warnings:
         if w.startswith("clean-up:"):
             print(f"  {w}")
+
+
+def cmd_delete(args) -> None:
+    paper = pipeline.load_paper(args.paper_id)
+    if not args.yes:
+        answer = input(f"Delete {paper.paper_id} ({paper.title}) with its figures and narrations? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            sys.exit("Not deleted.")
+    result = pipeline.delete_paper(args.paper_id)
+    print(f"Deleted {', '.join(result['deleted'])} ({result['freed_bytes'] / 1e6:.1f} MB)")
 
 
 def cmd_serve(args) -> None:
@@ -174,6 +187,16 @@ def _add_llm_args(p) -> None:
                    help="LLM clean-up after the rule filter: haiku (Anthropic API), codex (Codex CLI, "
                         "gpt-6-luna), none; auto = the first available")
     p.add_argument("--llm-model", help="override the runner's model, e.g. gpt-5.6-luna for codex")
+    _add_equations_arg(p)
+
+
+def _add_equations_arg(p) -> None:
+    p.add_argument("--equations", default="meaning", choices=["symbols", "meaning"],
+                   help='how the LLM reads maths: "meaning" (default: the reward at time step t equals the '
+                        'imitation weight ..., from the paper\'s definitions) or "symbols" (r t equals omega I ...)')
+    p.add_argument("--inline", default="meaning", choices=["symbols", "meaning"],
+                   help='how symbols inside sentences are read: "meaning" (default: "the center-of-mass reward '
+                        '$r^c_t$" -> "the center-of-mass reward") or "symbols" ("... reward r t to the c")')
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -203,13 +226,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("paper_id")
     p.add_argument("--out", help="directory (default: data/papers/<id>/llm)")
     p.add_argument("--parts", type=int, default=4, help="split into this many balanced parts")
+    _add_equations_arg(p)
     p.set_defaults(func=cmd_cleanup_export)
 
     p = sub.add_parser("cleanup-import", help="apply external clean-up answers through the guard")
     p.add_argument("paper_id")
     p.add_argument("files", nargs="+", help='JSON files: {"blocks": [{"id", "speech"}]}')
     p.add_argument("--model", default="claude-haiku (Claude Code subagent)")
+    _add_equations_arg(p)
     p.set_defaults(func=cmd_cleanup_import)
+
+    p = sub.add_parser("delete", help="remove a paper and everything stored for it")
+    p.add_argument("paper_id")
+    p.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    p.set_defaults(func=cmd_delete)
 
     p = sub.add_parser("estimate", help="price of clean-up and every TTS option")
     p.add_argument("paper_id")

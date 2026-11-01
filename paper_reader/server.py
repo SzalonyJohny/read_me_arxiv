@@ -33,12 +33,13 @@ class JobManager:
         self._lock = threading.Lock()
         self._pools = {"io": ThreadPoolExecutor(2, "ingest"), "gpu": ThreadPoolExecutor(1, "tts")}
 
-    def submit(self, kind: str, pool: str, fn: Callable[..., Any], **kwargs) -> str:
+    def submit(self, kind: str, pool: str, fn: Callable[..., Any], *, for_paper: str | None = None, **kwargs) -> str:
+        """Queue fn(progress=…, **kwargs). `for_paper` marks the paper the job works on (see busy)."""
         job_id = uuid.uuid4().hex[:12]
         with self._lock:
             self._jobs[job_id] = {"job_id": job_id, "kind": kind, "status": "queued", "progress": 0.0,
                                   "message": "Queued", "result": None, "error": None,
-                                  "created": time.time()}
+                                  "created": time.time(), "paper_id": for_paper}
         self._pools[pool].submit(self._run, job_id, fn, kwargs)
         return job_id
 
@@ -55,6 +56,11 @@ class JobManager:
         except Exception as exc:  # reported to the UI, full trace to the console
             traceback.print_exc()
             self._update(job_id, status="error", message="Failed", error=f"{type(exc).__name__}: {exc}")
+
+    def busy(self, paper_id: str) -> bool:
+        """Whether a queued or running job works on this paper (it must not be deleted under it)."""
+        with self._lock:
+            return any(j["paper_id"] == paper_id and j["status"] in ("queued", "running") for j in self._jobs.values())
 
     def get(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -74,6 +80,8 @@ class IngestRequest(BaseModel):
     url: str
     include_appendix: bool = False
     llm: Literal["haiku", "codex", "none"] | None = None  # None: the first available runner
+    equations: Literal["symbols", "meaning"] = "meaning"  # read defined symbols by meaning (default)
+    inline: Literal["symbols", "meaning"] = "meaning"  # the same for symbols inside sentences
 
 
 class SamplesRequest(BaseModel):
@@ -88,10 +96,14 @@ class PdfIngestRequest(BaseModel):
     method: Literal["arxiv", "text", "ocr"]
     include_appendix: bool = False
     llm: Literal["haiku", "codex", "none"] | None = None
+    equations: Literal["symbols", "meaning"] = "meaning"
+    inline: Literal["symbols", "meaning"] = "meaning"
 
 
 class CleanupRequest(BaseModel):
     llm: Literal["haiku", "codex", "none"] | None = None
+    equations: Literal["symbols", "meaning"] = "meaning"
+    inline: Literal["symbols", "meaning"] = "meaning"
 
 
 class LabRenderRequest(BaseModel):
@@ -159,7 +171,8 @@ def create_paper(req: IngestRequest) -> dict:
 
     def work(progress):
         paper = pipeline.ingest(req.url, include_appendix=req.include_appendix,
-                                llm=_runner(req.llm), progress=progress)
+                                llm=_runner(req.llm), equations=req.equations, inline=req.inline,
+                                progress=progress)
         return {"paper_id": paper.paper_id, "title": paper.title,
                 "cleanup": paper.cleanup.model_dump() if paper.cleanup else None}
 
@@ -187,12 +200,14 @@ def ingest_pdf(upload_id: str, req: PdfIngestRequest) -> dict:
 
     def work(progress):
         paper = pdf_ingest.ingest_pdf(upload_id, req.method, include_appendix=req.include_appendix,
-                                      llm=_runner(req.llm), progress=progress)
+                                      llm=_runner(req.llm), equations=req.equations, inline=req.inline,
+                                      progress=progress)
         return {"paper_id": paper.paper_id, "title": paper.title,
                 "cleanup": paper.cleanup.model_dump() if paper.cleanup else None}
 
     # OCR runs on the GPU worker so it never overlaps with TTS or the voice lab.
-    return {"job_id": jobs.submit(f"pdf-{req.method}", "gpu" if req.method == "ocr" else "io", work)}
+    target = None if req.method == "arxiv" else f"pdf-{upload_id[:12]}"
+    return {"job_id": jobs.submit(f"pdf-{req.method}", "gpu" if req.method == "ocr" else "io", work, for_paper=target)}
 
 
 @app.post("/api/papers/{paper_id}/cleanup")
@@ -201,15 +216,25 @@ def recleanup_paper(paper_id: str, req: CleanupRequest) -> dict:
     paper = _paper_or_404(paper_id)
 
     def work(progress):
-        cleaned = pipeline.run_cleanup(paper, _runner(req.llm), progress=progress)
+        cleaned = pipeline.run_cleanup(paper, _runner(req.llm), equations=req.equations, inline=req.inline,
+                                       progress=progress)
         return {"paper_id": paper_id, "cleanup": cleaned.cleanup.model_dump() if cleaned.cleanup else None}
 
-    return {"job_id": jobs.submit("cleanup", "io", work)}
+    return {"job_id": jobs.submit("cleanup", "io", work, for_paper=paper_id)}
 
 
 @app.get("/api/papers/{paper_id}")
 def get_paper(paper_id: str):
     return _paper_or_404(paper_id)
+
+
+@app.delete("/api/papers/{paper_id}")
+def delete_paper(paper_id: str) -> dict:
+    """Remove a paper from the library with everything stored for it (see pipeline.delete_paper)."""
+    _paper_or_404(paper_id)
+    if jobs.busy(paper_id):
+        raise HTTPException(409, "A job for this paper is still running; delete it when the job has finished.")
+    return pipeline.delete_paper(paper_id)
 
 
 @app.get("/api/papers/{paper_id}/estimate")
@@ -245,7 +270,7 @@ def start_tts(paper_id: str, req: TTSRequest) -> dict:
         return {"run_id": manifest.run_id, "manifest_url": f"/papers/{paper_id}/audio/{manifest.run_id}/manifest.json",
                 "duration": manifest.duration, "cost_usd": manifest.cost_usd}
 
-    return {"job_id": jobs.submit("tts", "gpu", work)}
+    return {"job_id": jobs.submit("tts", "gpu", work, for_paper=paper_id)}
 
 
 @app.get("/api/papers/{paper_id}/offline")
@@ -282,7 +307,7 @@ def tts_samples(req: SamplesRequest) -> dict:
                                         text=req.text, progress=progress)
         return {"samples": samples}
 
-    return {"job_id": jobs.submit("samples", "gpu", work)}
+    return {"job_id": jobs.submit("samples", "gpu", work, for_paper=req.paper_id)}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -309,7 +334,7 @@ def voicelab_view(paper_id: str) -> dict:
 def voicelab_render(paper_id: str, req: LabRenderRequest) -> dict:
     _paper_or_404(paper_id)
     work = lambda progress: voicelab.render(paper_id, req.engine, req.voices, req.models, progress)  # noqa: E731
-    return {"job_id": jobs.submit("voicelab-render", "gpu", work)}
+    return {"job_id": jobs.submit("voicelab-render", "gpu", work, for_paper=paper_id)}
 
 
 @app.post("/api/voicelab/{paper_id}/design")
@@ -319,7 +344,7 @@ def voicelab_design(paper_id: str, req: LabDesignRequest) -> dict:
         raise HTTPException(400, "describe the voice, or name a voice to redesign")
     work = lambda progress: voicelab.design(paper_id, req.description, req.models, req.redesign_of,  # noqa: E731
                                             progress)
-    return {"job_id": jobs.submit("voicelab-design", "gpu", work)}
+    return {"job_id": jobs.submit("voicelab-design", "gpu", work, for_paper=paper_id)}
 
 
 @app.get("/api/voices/selected")

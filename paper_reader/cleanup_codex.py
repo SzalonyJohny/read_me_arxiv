@@ -20,7 +20,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .cleanup import RESPONSE_SCHEMA, SYSTEM_PROMPT, _Answer, export_requests, import_answers
+from . import cleanup
+from .cleanup import EquationMode, _Answer, system_prompt
 from .models import CleanupStats, Paper
 
 CODEX_MODEL = "gpt-6-luna"
@@ -40,10 +41,11 @@ def codex_available() -> tuple[bool, str | None]:
     return True, None
 
 
-def _run_request(request: dict, schema: Path, workdir: Path, model: str, effort: str) -> tuple[list[dict], dict]:
+def _run_request(request: dict, schema: Path, workdir: Path, model: str, effort: str,
+                 mode: EquationMode = "symbols", inline: EquationMode | None = None) -> tuple[list[dict], dict]:
     """One `codex exec` run -> (answers, usage)."""
     out = workdir.parent / f"answer_{request['request_id']}.json"
-    prompt = f"{SYSTEM_PROMPT}\n\n---\n\n{RUN_RULES}\n\n{request['user_message']}"
+    prompt = f"{system_prompt(mode, inline)}\n\n---\n\n{RUN_RULES}\n\n{request['user_message']}"
     cmd = ["codex", "exec", "-m", model, "-c", f'model_reasoning_effort="{effort}"', "-s", "read-only",
            "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--output-schema", str(schema),
            "-o", str(out), "--json", "-C", str(workdir), "-"]
@@ -64,45 +66,61 @@ def _run_request(request: dict, schema: Path, workdir: Path, model: str, effort:
 
 def cleanup_paper_codex(paper: Paper, *, model: str = CODEX_MODEL, effort: str = CODEX_EFFORT,
                         max_workers: int = 4,
-                        progress_cb: Callable[[float, str], None] | None = None) -> CleanupStats:
-    """Run the clean-up through Codex. Mutates blocks and sets paper.cleanup (like cleanup_paper)."""
+                        progress_cb: Callable[[float, str], None] | None = None,
+                        equations: EquationMode = "symbols", inline: EquationMode | None = None) -> CleanupStats:
+    """Run the clean-up through Codex. Mutates blocks and sets paper.cleanup (like cleanup_paper).
+    In meaning mode, blocks that named a symbol differently are asked once more with the names."""
     label = f"codex:{model}"
     ok, reason = codex_available()
     if not ok:
-        paper.cleanup = CleanupStats(model=label, skipped_reason=reason)
+        paper.cleanup = CleanupStats(model=label, skipped_reason=reason, equation_mode=equations,
+                                     inline_mode=inline or equations)
         return paper.cleanup
 
-    requests = [r for group in export_requests(paper) for r in group]
-    answers: list[dict] = []
+    run = cleanup.begin_import(paper, model=label, mode=equations, inline=inline)  # same requests and guard
     errors: list[str] = []
     tokens = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
     with tempfile.TemporaryDirectory(prefix="paper-reader-codex-") as tmp:
         schema = Path(tmp) / "schema.json"
-        schema.write_text(json.dumps(RESPONSE_SCHEMA), encoding="utf-8")
+        schema.write_text(json.dumps(cleanup.response_schema(run.mode, run.inline)), encoding="utf-8")
         workdir = Path(tmp) / "work"
         workdir.mkdir()
 
-        def run(request: dict):
-            try:
-                return request, _run_request(request, schema, workdir, model, effort), None
-            except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-                return request, None, f"{request['section']}: {exc}"
+        def ask(requests: list, first_id: int, label_prefix: str) -> tuple[list[dict], int]:
+            """Run the requests through codex; returns the answers and how many requests failed."""
+            dicts = [cleanup.request_dict(r, first_id + i) for i, r in enumerate(requests)]
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for done, (request, result, error) in enumerate(pool.map(run, requests), 1):
-                if error:
-                    errors.append(error)
-                else:
-                    answers.extend(result[0])
-                    for key in tokens:
-                        tokens[key] += int(result[1].get(key) or 0)
-                if progress_cb:
-                    progress_cb(done / max(len(requests), 1), f"Clean-up {done}/{len(requests)}: {request['section']}")
+            def one(request: dict):
+                try:
+                    return request, _run_request(request, schema, workdir, model, effort, run.mode, run.inline), None
+                except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+                    return request, None, f"{request['section']}: {exc}"
 
-    if requests and len(errors) == len(requests):
-        paper.cleanup = CleanupStats(model=label, skipped_reason=f"every Codex request failed, e.g. {errors[0]}")
-        return paper.cleanup
-    stats = import_answers(paper, answers, model=label)  # same guard as the Haiku pass
+            answers, failed = [], 0
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for done, (request, result, error) in enumerate(pool.map(one, dicts), 1):
+                    if error:
+                        errors.append(error)
+                        failed += 1
+                    else:
+                        answers.extend(result[0])
+                        for key in tokens:
+                            tokens[key] += int(result[1].get(key) or 0)
+                    if progress_cb:
+                        progress_cb(done / max(len(dicts), 1), f"{label_prefix} {done}/{len(dicts)}: {request['section']}")
+            return answers, failed
+
+        answers, failed = ask(run.requests, 0, "Clean-up")
+        if run.requests and failed == len(run.requests):
+            paper.cleanup = CleanupStats(model=label, skipped_reason=f"every Codex request failed, e.g. {errors[0]}",
+                                         equation_mode=run.mode, inline_mode=run.inline)
+            return paper.cleanup
+        cleanup.apply_answers(run, run.requests, answers)
+        if "meaning" in (run.mode, run.inline) and (repairs := cleanup.repair_requests(run)):
+            repaired, _ = ask(repairs, len(run.requests), "Consistency repair")
+            cleanup.apply_answers(run, repairs, repaired)
+
+    stats = cleanup.finish(run)
     stats.input_tokens, stats.output_tokens = tokens["input_tokens"], tokens["output_tokens"]
     stats.cache_read_input_tokens = tokens["cached_input_tokens"]
     paper.warnings += [f"clean-up: {e}; kept the filter text" for e in errors]

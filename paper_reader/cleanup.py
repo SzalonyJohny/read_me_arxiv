@@ -21,15 +21,18 @@ import logging
 import os
 import re
 import threading
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import anthropic
 from pydantic import BaseModel, ValidationError
 
 from . import pricing
+from .definitions import DefinitionIndex, atom_key, math_atoms, paper_vocabulary, symbol_key
 from .models import Block, CleanupStats, Paper, Section
 from .textfilter import apply_filter, equation_label, equation_speech, filter_text, inline_math, latex_to_speech
 
@@ -57,6 +60,44 @@ MATH_REWRITE_FACTOR = 2.5
 CITATION_REPAIR_WORDS = 4
 SLACK_WORDS = 2
 MAX_EQUATION_WORDS = 80
+
+# Equation mode "meaning" reads defined symbols by what they mean ("the imitation weight" instead
+# of "omega to the I"): readings get longer, so the maths allowance and the equation length grow.
+# In return every word the model adds must occur in the paper (or be ordinary maths language or a
+# spoken unit), so a meaning can't be invented. MAX_UNGROUNDED is 0: on DeepMimic a single allowed
+# unknown word let "energy weight" through for w^e, which that paper defines as the end-effector weight.
+EquationMode = Literal["symbols", "meaning"]
+EQUATION_MODES: tuple[EquationMode, ...] = ("symbols", "meaning")
+MEANING_MATH_FACTOR = 4.0
+MAX_EQUATION_WORDS_MEANING = 140
+MAX_UNGROUNDED = 0
+DEFINITIONS_FOR_PROSE = {"max_sentences": 3, "max_chars": 600}
+_SPOKEN_MATH = set("""
+equals equal plus minus times divided over sum product integral expectation expected exponential
+logarithm square squared cube cubed root power inverse transpose norm absolute value gradient partial
+derivative respect drawn given from with each every all over interval between maximum minimum
+argmax argmin softmax function fraction quantity previous next current first last zero infinity
+greater less than approximately proportional distributed according vector matrix element entry
+divergence variance mean average probability distribution sequence tuple set index which where
+superscript subscript hat bar tilde star prime dotted dot cross conjugate magnitude elementwise
+capital uppercase lowercase calligraphic bold script blackboard
+projected projection onto
+hadamard concatenation concatenated composition indicator otherwise case cases condition such that per
+hertz kilohertz megahertz gigahertz second seconds milliseconds microseconds minute minutes hour hours
+meter meters centimeters millimeters kilometers kilogram kilograms grams newton newtons joules watts
+volts degrees radians percent pixels frames bytes kilobytes megabytes gigabytes
+""".split())
+# Words the prompt's own rules introduce: citation repairs, abbreviation expansions, spoken numbers.
+_RULE_WORDS = set("""
+earlier work works studies study colleagues example respect state versus approximately respectively
+compare online about zero three four five seven eight nine eleven twelve thirteen fourteen fifteen
+sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred
+thousand million billion point half quarter third fourth fifth tenth hundredth thousandth
+equation equations
+their them they these those this that then than when what whose whom with within without into onto
+upon under between across along through also only just both either neither other others same such
+very more most less much many some here there have been being were will would could should
+""".split())
 _PROSE_TYPES = ("paragraph", "list_item", "heading_note")
 _MARKUP = re.compile(r"[\\$]|\[CITE\]|[{}]")
 _FIGURE_MENTION = re.compile(r"\b(Figure|Table)s? (\d+)")
@@ -108,6 +149,50 @@ source stays, in the same order and with the same words, apart from the repairs 
 
 Worked examples follow. Each shows one input block and the output for it."""
 
+# Reading maths by meaning, for display equations and/or the symbols inside sentences (two options).
+_MEANING_COMMON = """MATHS BY MEANING. This listener wants {what} read by what the symbols mean, not \
+letter by letter. For every symbol the paper defines:
+- Blocks with maths may carry "definitions": sentences from elsewhere in the paper that define \
+the symbols the block uses. Together with "context", "context_after" and the block itself, they \
+are the ONLY source of meanings.
+- Name a defined symbol by its meaning ("the reward at time step t", "the imitation weight", "the \
+discount factor") instead of its letters ("r t", "omega I", "gamma"). Indices become their \
+meaning too when it is defined ("at time step t", "of skill k", "at the previous iteration").
+- A symbol the paper does not define keeps its spoken name ("beta", "K", "x"). Never guess a meaning.
+- The worked examples use their own symbols. In a request, a symbol means only what that request's \
+definitions, context and block say: never carry a meaning over from an example or another paper.
+- One name per symbol for the whole paper: a symbol is read the same way in every equation and \
+sentence. When a request gives "names" (symbol -> name), use exactly those names.
+- For every block also return "symbols": each symbol you named by meaning, as {"latex": the bare \
+symbol, "name": the name you said, without "the" and without its indices}, for example \
+{"latex": "r^{I}_{t}", "name": "imitation objective"}. Leave it empty when you named none."""
+_MEANING_EQUATIONS = """- Display equations (instead of rule 3): keep the mathematical structure exact. Every \
+term, operator, sum, fraction, exponent, condition and constant stays, in the same order, said with \
+"equals", "plus", "minus", "times", "divided by", "the sum over ... of", "the expectation over ... \
+of", "the exponential of", "to the power". Do not simplify, merge or drop terms, and do not explain \
+why the equation holds. "Equation N:" when it is numbered, then one flowing sentence (two at most \
+for a long equation)."""
+_MEANING_INLINE = """- Symbols inside sentences (instead of rule 2): read a defined symbol by its meaning, inside \
+the sentence's own words; the rest of the sentence stays word for word. When the words right \
+before the symbol already name it ("the slip penalty $\\kappa_{t}$"), drop the symbol instead of \
+saying the name twice. But in the sentence that defines a symbol ("$u_{t}$ denotes the foot speed", \
+"with $u_{t}$ being ...", "where $u_{t}$ is ..."), keep the symbol's spoken letters: replacing it \
+there would make the definition say "the foot speed denotes the foot speed". A bracketed list of \
+words ("$e \\in$ [left foot, right foot]") is a set, read "one of left foot, right foot", not an interval."""
+_SYMBOLS_EQUATIONS = "- Display equations are read as rule 3 says, symbol by symbol."
+_SYMBOLS_INLINE = "- Symbols inside sentences are read as rule 2 says, symbol by symbol."
+_MEANING_SCOPE = {("meaning", "meaning"): "equations and the symbols inside sentences",
+                  ("meaning", "symbols"): "display equations",
+                  ("symbols", "meaning"): "the symbols inside sentences"}
+
+
+def _meaning_rules(mode: EquationMode, inline: EquationMode) -> str:
+    return "\n".join([
+        _MEANING_COMMON.replace("{what}", _MEANING_SCOPE[mode, inline]),
+        _MEANING_EQUATIONS if mode == "meaning" else _SYMBOLS_EQUATIONS,
+        _MEANING_INLINE if inline == "meaning" else _SYMBOLS_INLINE,
+    ])
+
 
 @dataclass(frozen=True)
 class _Example:
@@ -117,6 +202,10 @@ class _Example:
     eq_number: str | None = None  # equation examples: source is the LaTeX
     context: str = ""
     context_after: str = ""
+    mode: Literal["both", "symbols", "meaning"] = "both"  # which prompt variant shows it
+    definitions: tuple[str, ...] = ()
+    symbols: tuple[tuple[str, str], ...] = ()  # meaning mode: (LaTeX, name) pairs the output names
+    is_equation: bool = False  # an unnumbered display equation (eq_number None) is still an equation
 
 
 _EXAMPLES = [
@@ -180,39 +269,140 @@ _EXAMPLES = [
              "and p of z.",
              eq_number="4",
              context="We train the world model by minimizing a reconstruction loss and a KL regularizer:",
-             context_after=r"where $\beta$ weights the KL term."),
+             context_after=r"where $\beta$ weights the KL term.", mode="symbols"),
     _Example("A short display equation: read it verbatim",
              r"a_t = \pi_\theta(o_t)",
              "Equation 2: a t equals pi theta of o t.",
              eq_number="2",
-             context="At every step the policy maps the observation to an action:"),
+             context="At every step the policy maps the observation to an action:", mode="symbols"),
+    # ---- equation mode "meaning"
+    _Example("Meaning mode: a weighted sum, every symbol named by what it means",
+             r"r_{t}=\lambda_{1}r^{\mathrm{trk}}_{t}-\lambda_{2}r^{\mathrm{tq}}_{t}",
+             "Equation 3: the reward at time step t equals the tracking weight times the tracking reward at "
+             "time step t, minus the torque weight times the torque penalty at time step t.",
+             eq_number="3", mode="meaning",
+             context="The reward combines target tracking with a torque penalty:",
+             context_after=r"Here, $r^{\mathrm{trk}}_{t}$ rewards tracking the target and $r^{\mathrm{tq}}_{t}$ "
+                           r"penalizes large joint torques, with $\lambda_{1}$ and $\lambda_{2}$ being their weights.",
+             definitions=(r"The reward $r_{t}$ is given to the policy at every time step $t$.",),
+             symbols=(("r_{t}", "reward"), (r"\lambda_{1}", "tracking weight"), (r"r^{\mathrm{trk}}_{t}", "tracking reward"),
+                      (r"\lambda_{2}", "torque weight"), (r"r^{\mathrm{tq}}_{t}", "torque penalty"))),
+    _Example("Meaning mode: an expectation with a sum, structure kept exactly",
+             r"J(\theta)=\mathbb{E}_{\tau\sim p_{\theta}(\tau)}\left[\sum_{t=0}^{T}\gamma^{t}r_{t}\right]",
+             "Equation 1: the expected return, as a function of the policy parameters, equals the expectation, "
+             "over trajectories drawn from the trajectory distribution of the policy, of the sum from time step "
+             "0 to the episode horizon T of the discount factor to the power t times the reward at time step t.",
+             eq_number="1", mode="meaning",
+             context=r"The agent learns policy parameters $\theta$ that maximize its expected return:",
+             context_after=r"where $p_{\theta}(\tau)$ is the trajectory distribution induced by the policy and "
+                           r"$\gamma$ is the discount factor.",
+             definitions=(r"The reward $r_{t}$ is received at time step $t$, and $T$ is the episode horizon.",),
+             symbols=((r"J(\theta)", "expected return"), (r"\theta", "policy parameters"),
+                      (r"p_{\theta}(\tau)", "trajectory distribution of the policy"), ("T", "episode horizon"),
+                      (r"\gamma", "discount factor"), ("r_{t}", "reward"))),
+    _Example("Meaning mode: a fraction, both parts said in full",
+             r"p_{k}=\frac{\exp(s_{k}/\tau)}{\sum_{j=1}^{K}\exp(s_{j}/\tau)}",
+             "Equation 5: the probability of sampling skill k equals the exponential of its learning score "
+             "divided by the temperature, divided by the sum over all K skills of the exponential of their "
+             "learning score divided by the temperature.",
+             eq_number="5", mode="meaning",
+             context="Skills are sampled in proportion to how much they are improving:",
+             context_after=r"where $s_{k}$ is the learning score of skill $k$ and $\tau$ is a temperature.",
+             definitions=(r"We train $K$ skills, and $p_{k}$ is the probability of sampling skill $k$ in the "
+                          r"next episode.",),
+             symbols=(("p_{k}", "probability of sampling skill"), ("s_{k}", "learning score"), (r"\tau", "temperature"))),
+    _Example("Meaning mode: a symbol the paper never defines keeps its name (beta)",
+             r"\mathcal{L}=\mathcal{L}_{\mathrm{rec}}+\beta\,D_{\mathrm{KL}}\big(q_{\phi}(z\mid x)\,\|\,p(z)\big)",
+             "Equation 2: the loss equals the reconstruction loss plus beta times the KL divergence between "
+             "the encoder distribution over the latent code z given the input x and the standard normal prior.",
+             eq_number="2", mode="meaning",
+             context=r"We train the model by minimizing the loss $\mathcal{L}$:",
+             definitions=(r"$\mathcal{L}_{\mathrm{rec}}$ is the reconstruction loss of the decoder.",
+                          r"The encoder $q_{\phi}(z\mid x)$ maps an input $x$ to a distribution over the latent "
+                          r"code $z$, and $p(z)$ is a standard normal prior."),
+             symbols=((r"\mathcal{L}", "loss"), (r"\mathcal{L}_{\mathrm{rec}}", "reconstruction loss"),
+                      (r"q_{\phi}(z\mid x)", "encoder distribution over the latent code"), ("p(z)", "standard normal prior"))),
+    _Example("Meaning mode: indices said by their meaning",
+             r"\Delta_{k}=\bar{R}_{k}^{(i)}-\bar{R}_{k}^{(i-1)}",
+             "Equation 6: the learning progress of skill k equals the average return of skill k at iteration "
+             "i minus its average return at the previous iteration.",
+             eq_number="6", mode="meaning",
+             context="We measure how fast each skill improves:",
+             context_after=r"where $\bar{R}_{k}^{(i)}$ is the average return of skill $k$ at iteration $i$.",
+             definitions=(r"We call $\Delta_{k}$ the learning progress of skill $k$.",),
+             symbols=((r"\Delta_{k}", "learning progress"), (r"\bar{R}_{k}^{(i)}", "average return"))),
+    _Example("Symbols in sentences: the words already name the symbol, so the symbol is dropped",
+             r"The slip penalty $\kappa_{t}$ discourages foot sliding and is computed from the foot speed $u_{t}$.",
+             "The slip penalty discourages foot sliding and is computed from the foot speed.",
+             mode="meaning", symbols=((r"\kappa_{t}", "slip penalty"), ("u_{t}", "foot speed"))),
+    _Example("Symbols in sentences: a symbol on its own is read by its meaning",
+             r"When $\kappa_{t}$ grows, the policy shortens its stride.",
+             "When the slip penalty grows, the policy shortens its stride.",
+             mode="meaning",
+             definitions=(r"The slip penalty $\kappa_{t}$ discourages foot sliding and is computed from the foot "
+                          r"speed $u_{t}$.",),
+             symbols=((r"\kappa_{t}", "slip penalty"),)),
+    _Example("Symbols in sentences: the sentence that defines a symbol keeps its letters",
+             r"Here, $u_{t}$ denotes the foot speed of leg $l \in$ [front left, front right], in meters per second.",
+             "Here, u t denotes the foot speed of leg l, one of front left and front right, in meters per second.",
+             mode="meaning"),
+    _Example("Meaning mode: inline maths inside a sentence",
+             r"For all tasks we set $\lambda_{1}=1.0$ and $\lambda_{2}=0.05$.",
+             "For all tasks we set the tracking weight to 1.0 and the torque weight to 0.05.",
+             mode="meaning",
+             definitions=(r"Here, $r^{\mathrm{trk}}_{t}$ rewards tracking the target and $r^{\mathrm{tq}}_{t}$ "
+                          r"penalizes large joint torques, with $\lambda_{1}$ and $\lambda_{2}$ being their weights.",),
+             symbols=((r"\lambda_{1}", "tracking weight"), (r"\lambda_{2}", "torque weight"))),
 ]
 
 
 def _example_block(example: _Example, index: int) -> dict:
     block_id = f"ex{index:02d}"
-    if example.eq_number is None:
-        return {"id": block_id, "type": "paragraph", "source": example.source,
+    definitions = {"definitions": list(example.definitions)} if example.definitions else {}
+    if example.eq_number is None and not example.is_equation:
+        return {"id": block_id, "type": "paragraph", "source": example.source, **definitions,
                 "filter_speech": filter_text(example.source)}
     block = Block(id=block_id, type="equation", latex=example.source, eq_number=example.eq_number)
-    return {"id": block_id, "type": "equation", "latex": example.source, "eq_number": example.eq_number,
-            "context": example.context, "context_after": example.context_after,
+    return {"id": block_id, "type": "equation", "latex": example.source, "eq_number": example.eq_number or "",
+            "context": example.context, "context_after": example.context_after, **definitions,
             "filter_speech": equation_speech(block)}
 
 
-def _build_system_prompt() -> str:
-    parts = [_JOB]
-    for index, example in enumerate(_EXAMPLES, 1):
+def examples_for(mode: EquationMode, inline: EquationMode | None = None) -> list[_Example]:
+    """The worked examples for a reading: equation examples follow `mode`, sentence examples `inline`."""
+    inline = inline or mode
+    return [e for e in _EXAMPLES
+            if e.mode == "both" or e.mode == (mode if e.eq_number or e.is_equation else inline)]
+
+
+def _build_system_prompt(mode: EquationMode, inline: EquationMode | None = None) -> str:
+    inline = inline or mode
+    meaning = "meaning" in (mode, inline)
+    parts = [_JOB] + ([_meaning_rules(mode, inline)] if meaning else [])
+    for index, example in enumerate(examples_for(mode, inline), 1):
         block = _example_block(example, index)
         answer = {"id": block["id"], "speech": example.speech}
+        if meaning:
+            answer["symbols"] = [{"latex": latex, "name": name} for latex, name in example.symbols]
         parts.append(f"Example {index}. {example.title}.\n"
                      f"Input: {json.dumps(block, ensure_ascii=False)}\n"
                      f"Output: {json.dumps(answer, ensure_ascii=False)}")
     return "\n\n".join(parts) + "\n"
 
 
-# Built once per process from constants only, so it is byte-identical on every request.
-SYSTEM_PROMPT = _build_system_prompt()
+# Built once per process from constants only, so each is byte-identical on every request
+# (one prompt cache per reading: equations x symbols inside sentences).
+SYSTEM_PROMPTS: dict[tuple[EquationMode, EquationMode], str] = {
+    (mode, inline): _build_system_prompt(mode, inline) for mode in EQUATION_MODES for inline in EQUATION_MODES}
+SYSTEM_PROMPT = SYSTEM_PROMPTS["symbols", "symbols"]
+
+
+def system_prompt(mode: EquationMode = "symbols", inline: EquationMode | None = None) -> str:
+    """mode: display equations; inline: symbols inside sentences (None = same as mode)."""
+    key = (mode, inline or mode)
+    if key not in SYSTEM_PROMPTS:
+        raise ValueError(f"unknown reading {key!r}; each part is one of {', '.join(EQUATION_MODES)}")
+    return SYSTEM_PROMPTS[key]
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -230,11 +420,29 @@ RESPONSE_SCHEMA = {
     "required": ["blocks"],
     "additionalProperties": False,
 }
+RESPONSE_SCHEMA_MEANING = json.loads(json.dumps(RESPONSE_SCHEMA))
+_item = RESPONSE_SCHEMA_MEANING["properties"]["blocks"]["items"]
+_item["properties"]["symbols"] = {
+    "type": "array",
+    "items": {"type": "object", "properties": {"latex": {"type": "string"}, "name": {"type": "string"}},
+              "required": ["latex", "name"], "additionalProperties": False},
+}
+_item["required"] = ["id", "speech", "symbols"]
+
+
+def response_schema(mode: EquationMode = "symbols", inline: EquationMode | None = None) -> dict:
+    return RESPONSE_SCHEMA_MEANING if "meaning" in (mode, inline or mode) else RESPONSE_SCHEMA
+
+
+class _SymbolName(BaseModel):
+    latex: str
+    name: str
 
 
 class _BlockSpeech(BaseModel):
     id: str
     speech: str
+    symbols: list[_SymbolName] = []  # meaning mode: the names this block's reading used
 
 
 class _Answer(BaseModel):
@@ -260,21 +468,33 @@ def _neighbour_text(blocks: list[Block], start: int, step: int) -> str:
     return ""
 
 
-def _block_payload(section: Section, index: int) -> dict:
+def _block_payload(section: Section, index: int, definitions: DefinitionIndex | None = None,
+                   mode: EquationMode = "meaning", inline: EquationMode | None = None) -> dict:
+    """One block as the model sees it. With a DefinitionIndex, blocks whose maths is read by meaning
+    (equations when mode is "meaning", sentences when inline is) carry the paper's definitions."""
+    inline = inline or mode
     block = section.blocks[index]
     payload = {"id": block.id, "type": block.type}
     if block.type == "equation":
+        context = _neighbour_text(section.blocks, index, -1)
+        context_after = _neighbour_text(section.blocks, index, +1)
         payload |= {"latex": block.latex or "", "eq_number": block.eq_number or "",
-                    "context": _neighbour_text(section.blocks, index, -1),
-                    "context_after": _neighbour_text(section.blocks, index, +1)}
+                    "context": context, "context_after": context_after}
+        found = definitions.for_block(block, skip=(context, context_after)) if definitions and mode == "meaning" else []
     else:
         payload["source"] = block.text
+        by_meaning = definitions and inline == "meaning" and "$" in block.text
+        found = definitions.for_block(block, **DEFINITIONS_FOR_PROSE) if by_meaning else []
+    if found:
+        payload["definitions"] = found
     payload["filter_speech"] = block.speech or ""
     return payload
 
 
-def plan_requests(paper: Paper) -> list[CleanupRequest]:
+def plan_requests(paper: Paper, mode: EquationMode = "symbols", inline: EquationMode | None = None) -> list[CleanupRequest]:
     """One request per section, split into chunks of at most MAX_CHUNK_CHARS of block JSON."""
+    inline = inline or mode
+    definitions = DefinitionIndex(paper) if "meaning" in (mode, inline) else None
     requests = []
     for section in paper.sections:
         heading = section.speech_title or section.title
@@ -283,7 +503,7 @@ def plan_requests(paper: Paper) -> list[CleanupRequest]:
         for index, block in enumerate(section.blocks):
             if not block.speak or block.type == "figure" or not (block.speech or block.type == "equation"):
                 continue
-            payload = _block_payload(section, index)
+            payload = _block_payload(section, index, definitions, mode, inline)
             length = len(json.dumps(payload, ensure_ascii=False))
             if chunk and size + length > MAX_CHUNK_CHARS:
                 requests.append(_request(paper, section, heading, chunk))
@@ -313,23 +533,60 @@ def _figure_mentions(text: str) -> set[tuple[str, str]]:
     return set(_FIGURE_MENTION.findall(text))
 
 
-def guard_accepts(block: Block, speech: str) -> bool:
-    """Whether the model's speech may replace the filter speech of this block."""
+def _word_forms(word: str) -> set[str]:
+    """The word and its likely base forms: entries/entry, separated/separate, weighting/weight."""
+    forms = {word, word.rstrip("s")}
+    for suffix, replacement in (("ies", "y"), ("es", ""), ("ed", ""), ("ed", "e"), ("ing", ""), ("ing", "e"), ("ly", "")):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            forms.add(word[: -len(suffix)] + replacement)
+    return forms
+
+
+def _ungrounded(speech: str, filtered: str, vocabulary: set[str]) -> list[str]:
+    """Content words the model added that the paper never uses: an invented meaning."""
+    known = set(_words(filtered)) | vocabulary | _SPOKEN_MATH | _RULE_WORDS
+    added = re.findall(r"[a-z]+", speech.lower())
+    return [w for w in added if len(w) > 3 and not (_word_forms(w) & known)]
+
+
+def guard_accepts(block: Block, speech: str, *, mode: EquationMode = "symbols", inline: EquationMode | None = None,
+                  vocabulary: set[str] | None = None) -> bool:
+    """Whether the model's speech may replace the filter speech of this block. Where maths is read by
+    meaning, readings may be longer, and with a vocabulary every added word must be grounded in the paper."""
+    return guard_reason(block, speech, mode=mode, inline=inline, vocabulary=vocabulary) is None
+
+
+def guard_reason(block: Block, speech: str, *, mode: EquationMode = "symbols", inline: EquationMode | None = None,
+                 vocabulary: set[str] | None = None) -> str | None:
+    """None if the speech is acceptable, else why not (shown as a clean-up warning). `mode` is how
+    display equations are read, `inline` how symbols inside sentences are (None = same as mode)."""
+    by_meaning = (mode if block.type == "equation" else inline or mode) == "meaning"
     speech = " ".join(speech.split())
     filtered = block.speech if block.speech is not None else filter_text(block.text)
-    if not speech or _MARKUP.search(speech) or not _figure_mentions(filtered) <= _figure_mentions(speech):
-        return False
+    if not speech:
+        return "empty answer"
+    if _MARKUP.search(speech):
+        return "LaTeX or markup left in the answer"
+    if not _figure_mentions(filtered) <= _figure_mentions(speech):
+        return "a Figure/Table mention was lost"
+    if by_meaning and vocabulary is not None:
+        unknown = _ungrounded(speech, filtered, vocabulary)
+        if len(unknown) > MAX_UNGROUNDED:
+            return f"words not found in the paper: {', '.join(unknown[:5])}"
     if block.type == "equation":
-        return len(speech.split()) <= MAX_EQUATION_WORDS
+        limit = MAX_EQUATION_WORDS_MEANING if by_meaning else MAX_EQUATION_WORDS
+        words = len(speech.split())
+        return f"equation reading too long ({words} > {limit} words)" if words > limit else None
     before, after = _words(filtered), _words(speech)
     matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
     kept = sum(match.size for match in matcher.get_matching_blocks())
     changed = len(before) + len(after) - 2 * kept
     math_words = sum(len(latex_to_speech(span).split()) for span in inline_math(block.text))
     citations = block.text.count("[CITE]")
-    allowance = (REWRITE_BUDGET * max(len(before) - math_words, 0) + MATH_REWRITE_FACTOR * math_words
+    math_factor = MEANING_MATH_FACTOR if by_meaning else MATH_REWRITE_FACTOR
+    allowance = (REWRITE_BUDGET * max(len(before) - math_words, 0) + math_factor * math_words
                  + CITATION_REPAIR_WORDS * citations + SLACK_WORDS)
-    return changed <= allowance
+    return None if changed <= allowance else f"rewrote too much ({changed} words changed, {allowance:.0f} allowed)"
 
 
 # ---------------------------------------------------------------- the run
@@ -362,6 +619,11 @@ class _Run:
     total: int
     progress_cb: Callable[[float, str], None] | None
     stats: CleanupStats = field(default_factory=CleanupStats)
+    mode: EquationMode = "symbols"  # display equations
+    inline: EquationMode = "symbols"  # symbols inside sentences
+    vocabulary: set[str] | None = None  # meaning mode: words the paper uses (grounding check)
+    requests: list[CleanupRequest] = field(default_factory=list)
+    uses: dict[str, list[_SymbolName]] = field(default_factory=dict)  # block id -> names its reading used
     lock: threading.Lock = field(default_factory=threading.Lock)
     stopped: threading.Event = field(default_factory=threading.Event)
     done: int = 0
@@ -374,9 +636,11 @@ class _Run:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=MAX_OUTPUT_TOKENS,
-                system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                system=[{"type": "text", "text": system_prompt(self.mode, self.inline),
+                         "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": request.user_message}],
-                output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
+                output_config={"effort": EFFORT,
+                               "format": {"type": "json_schema", "schema": response_schema(self.mode, self.inline)}},
             )
             self._account(response.usage)
             self._apply(request, _parse(response), label)
@@ -410,23 +674,30 @@ class _Run:
             self.stats.cost_usd += cost
 
     def _apply(self, request: CleanupRequest, answers: list[_BlockSpeech], label: str) -> None:
-        speech_by_id: dict[str, str] = {}
+        by_id: dict[str, _BlockSpeech] = {}
         for answer in answers:
-            speech_by_id.setdefault(answer.id, " ".join(answer.speech.split()))
+            by_id.setdefault(answer.id, answer)
         accepted = rejected = missing = 0
         for block in request.blocks:
-            speech = speech_by_id.get(block.id)
+            answer = by_id.get(block.id)
+            speech = " ".join(answer.speech.split()) if answer else None
             if speech is None:
                 missing += 1
-            elif guard_accepts(block, speech):
+            elif (reason := guard_reason(block, speech, mode=self.mode, inline=self.inline,
+                                         vocabulary=self.vocabulary)) is None:
                 label_text = equation_label(block.eq_number) if block.type == "equation" else None
                 if label_text and label_text not in speech:
                     speech = f"{label_text}: {speech}"
                 block.speech, block.speech_source = speech, "llm"
+                with self.lock:
+                    self.uses[block.id] = answer.symbols
                 accepted += 1
             else:
                 block.speech_source = "llm_rejected"
+                with self.lock:
+                    self.uses.pop(block.id, None)
                 rejected += 1
+                self._warn(f"{block.id} kept the rule-based text: {reason}")
         with self.lock:
             self.stats.blocks_llm += accepted
             self.stats.blocks_rejected += rejected
@@ -437,6 +708,159 @@ class _Run:
         log.warning("clean-up: %s", message)
         with self.lock:
             self.paper.warnings.append(f"clean-up: {message}")
+
+
+# ---------------------------------------------------------------- symbol consistency (meaning mode)
+
+_NAME_PREFIX = re.compile(r"^(?:the|a|an|its|their|our|each)\s+")
+# "action at time step t", "reward at each step t plus 1": the time index is not part of the name
+_TIME_INDEX = re.compile(r"\s+(?:at|for|in)\s+(?:each\s+|every\s+|the\s+)?(?:time\s+)?(?:step|time)\s+[a-z]"
+                         r"(?:\s+(?:plus|minus)\s+\w+)?$")
+
+
+def normalize_name(name: str) -> str:
+    """'The Imitation-Weight at time step t' -> 'imitation weight' (articles, case, hyphens, spacing
+    and a trailing time index don't count)."""
+    text = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    return _TIME_INDEX.sub("", _NAME_PREFIX.sub("", text))
+
+
+_NAME_FILLER = {"the", "and", "for", "with", "over", "given", "from", "into", "under", "its", "their", "per"}
+
+
+def says_name(name: str, speech: str) -> bool:
+    """Whether a reading says this name: all of its content words occur, in any order and word form.
+    So "policy probability of the action given the state" is said by "the probability of the action
+    given the state under the policy", and "imitation weight" by "the weight for imitation", while
+    "the imitation coefficient" does not say "imitation weight": a different word means a different name."""
+    spoken = {form for word in speech.split() for form in _word_forms(word)}
+    words = [w for w in name.split() if len(w) > 2 and w not in _NAME_FILLER]
+    return all(_word_forms(w) & spoken for w in words) if words else name in speech
+
+
+@dataclass
+class ConsistencyReport:
+    names: dict[tuple, str]  # symbol key -> the canonical name (most used, ties: first in reading order)
+    shown: dict[tuple, str]  # symbol key -> its LaTeX as first reported, for display and repair requests
+    issues: list[tuple[str, str, str, str]]  # (block id, LaTeX, name used / problem, canonical name)
+
+    def describe(self) -> list[str]:
+        return [f"{latex}: {block_id} {used} instead of \"{name}\"" for block_id, latex, used, name in self.issues]
+
+
+def check_consistency(uses: dict[str, list[_SymbolName]], speeches: dict[str, str],
+                      order: list[str], equations: set[str] | None = None) -> ConsistencyReport:
+    """The same symbol must be read the same way in every block. A block fails when it reported a
+    different name for a symbol, or (display equations, whose reading is built from the symbols)
+    when its speech doesn't actually say the canonical name. Prose keeps the paper's own words, so
+    "the character state $s_t$" read as "the character state" is fine there.
+    `order` is the reading order of block ids (it breaks ties and orders the issues);
+    `equations` are the ids of display-equation blocks (default: every block is checked as one)."""
+    position = {block_id: i for i, block_id in enumerate(order)}
+    counts: dict[tuple, Counter] = {}
+    first_use: dict[tuple, int] = {}  # (key, name) -> position of its first use
+    shown: dict[tuple, tuple[int, str]] = {}  # key -> (position, LaTeX) of its first report
+    for block_id, symbols in uses.items():
+        at = position.get(block_id, len(position))
+        for symbol in symbols:
+            key, name = symbol_key(symbol.latex), normalize_name(symbol.name)
+            if key is None or not name:
+                continue
+            counts.setdefault(key, Counter())[name] += 1
+            first_use[key, name] = min(first_use.get((key, name), at), at)
+            shown[key] = min(shown.get(key, (at, symbol.latex)), (at, symbol.latex))
+    # the most used name wins; a tie goes to the name used first in reading order
+    canonical = {key: max(names, key=lambda n: (names[n], -first_use[key, n])) for key, names in counts.items()}
+    issues = []
+    for block_id in sorted(uses, key=lambda b: position.get(b, 1 << 30)):
+        spoken = re.sub(r"[^a-z0-9]+", " ", speeches.get(block_id, "").lower())
+        for symbol in uses[block_id]:
+            key = symbol_key(symbol.latex)
+            if key not in canonical:
+                continue
+            name = canonical[key]
+            if normalize_name(symbol.name) != name:
+                issues.append((block_id, symbol.latex, f"said \"{normalize_name(symbol.name)}\"", name))
+            elif (equations is None or block_id in equations) and not says_name(name, spoken):
+                issues.append((block_id, symbol.latex, "doesn't say the name", name))
+    return ConsistencyReport(names=canonical, shown={k: latex for k, (_, latex) in shown.items()}, issues=issues)
+
+
+def consistency(run: "_Run") -> ConsistencyReport:
+    blocks = list(run.paper.iter_blocks())
+    return check_consistency(run.uses, {b.id: b.speech or "" for b in blocks}, [b.id for b in blocks],
+                             equations={b.id for b in blocks if b.type == "equation"})
+
+
+def repair_requests(run: "_Run") -> list[CleanupRequest]:
+    """Blocks that named a symbol differently, asked again with the canonical names, once."""
+    report = consistency(run)
+    flagged = {block_id for block_id, *_ in report.issues}
+    if not flagged:
+        return []
+    definitions = DefinitionIndex(run.paper)
+    requests = []
+    for section in run.paper.sections:
+        payloads, blocks = [], []
+        for index, block in enumerate(section.blocks):
+            if block.id not in flagged:
+                continue
+            payload = _block_payload(section, index, definitions, run.mode, run.inline)
+            latex = block.latex if block.type == "equation" else " ".join(inline_math(block.text))
+            keys = {symbol_key(x.latex) for x in run.uses.get(block.id, [])}
+            keys |= {atom_key(a) for a in math_atoms(latex or "")}
+            payload["names"] = {report.shown[k]: report.names[k] for k in report.names if k in keys}
+            payloads.append(payload)
+            blocks.append(block)
+        if blocks:
+            heading = section.speech_title or section.title
+            message = (f"Paper: {run.paper.title}\nSection: {heading}\n\nThese blocks named some symbols "
+                       f"differently from the rest of the paper. Use exactly the names in \"names\" for those "
+                       f"symbols (with \"the\" and the indices as usual).\n"
+                       f"Return the narration of these {len(blocks)} blocks:\n"
+                       f"{json.dumps(payloads, ensure_ascii=False, indent=1)}")
+            requests.append(CleanupRequest(section, blocks, message))
+    with run.lock:
+        run.stats.symbols_repaired += len(flagged)
+    return requests
+
+
+def finish(run: "_Run") -> CleanupStats:
+    """Close a pass: in meaning mode record the symbol names and any remaining inconsistency."""
+    if "meaning" in (run.mode, run.inline):
+        report = consistency(run)
+        run.stats.symbol_names = {report.shown[k]: name for k, name in report.names.items()}
+        run.stats.inconsistent_symbols = report.describe()
+        for line in run.stats.inconsistent_symbols:
+            run._warn(f"symbol read inconsistently: {line}")
+    run.stats.cost_usd = round(run.stats.cost_usd, 6)
+    run.paper.cleanup = run.stats
+    return run.stats
+
+
+def begin_import(paper: Paper, *, model: str, mode: EquationMode = "symbols",
+                 inline: EquationMode | None = None) -> "_Run":
+    """A pass whose answers come from outside (Codex, subagents): filter text reset, requests planned."""
+    apply_filter(paper)
+    paper.warnings = [w for w in paper.warnings if not w.startswith("clean-up:")]
+    requests = plan_requests(paper, mode, inline)
+    return _new_run(paper, None, model, requests, None, mode, inline)
+
+
+def apply_answers(run: "_Run", requests: list[CleanupRequest], answers: list[dict]) -> None:
+    """External answers ([{"id", "speech", "symbols"?}], any order) through the same guard."""
+    try:
+        parsed = [_BlockSpeech.model_validate(a) for a in answers]
+    except ValidationError as exc:
+        raise ValueError(f"answers are not [{{id, speech}}] ({exc.error_count()} errors)") from exc
+    for request in requests:
+        ids = {b.id for b in request.blocks}
+        run._apply(request, [a for a in parsed if a.id in ids], request.section.speech_title or request.section.id)
+
+
+def request_dict(request: CleanupRequest, request_id: int) -> dict:
+    return {"request_id": request_id, "section": request.section.speech_title or request.section.id,
+            "block_ids": [b.id for b in request.blocks], "user_message": request.user_message}
 
 
 def _parse(response) -> list[_BlockSpeech]:
@@ -456,14 +880,24 @@ def _parse(response) -> list[_BlockSpeech]:
 # ---------------------------------------------------------------- offline runner (e.g. Claude Code subagents)
 
 
-def export_requests(paper: Paper, parts: int = 1) -> list[list[dict]]:
+def _new_run(paper: Paper, client, model: str, requests: list[CleanupRequest], progress_cb,
+             mode: EquationMode, inline: EquationMode | None = None) -> _Run:
+    inline = inline or mode
+    for value in (mode, inline):
+        if value not in EQUATION_MODES:
+            raise ValueError(f"unknown reading {value!r}; choose from {', '.join(EQUATION_MODES)}")
+    return _Run(paper, client, model, max(len(requests), 1), progress_cb,
+                CleanupStats(model=model, equation_mode=mode, inline_mode=inline), mode=mode, inline=inline,
+                vocabulary=paper_vocabulary(paper) if "meaning" in (mode, inline) else None, requests=requests)
+
+
+def export_requests(paper: Paper, parts: int = 1, mode: EquationMode = "symbols",
+                    inline: EquationMode | None = None) -> list[list[dict]]:
     """The exact requests the API pass would send, in `parts` groups balanced by size, so another
-    runner (e.g. Claude Code subagents on Haiku) can answer them with SYSTEM_PROMPT as instructions.
-    Each request: {request_id, section, block_ids, user_message}."""
+    runner (e.g. Claude Code subagents on Haiku) can answer them with system_prompt(mode) as
+    instructions. Each request: {request_id, section, block_ids, user_message}."""
     apply_filter(paper)
-    requests = [{"request_id": i, "section": r.section.speech_title or r.section.id,
-                 "block_ids": [b.id for b in r.blocks], "user_message": r.user_message}
-                for i, r in enumerate(plan_requests(paper))]
+    requests = [request_dict(r, i) for i, r in enumerate(plan_requests(paper, mode, inline))]
     groups: list[list[dict]] = [[] for _ in range(max(1, min(parts, len(requests))))]
     sizes = [0] * len(groups)
     for request in sorted(requests, key=lambda r: -len(r["user_message"])):
@@ -473,27 +907,21 @@ def export_requests(paper: Paper, parts: int = 1) -> list[list[dict]]:
     return [sorted(group, key=lambda r: r["request_id"]) for group in groups]
 
 
-def import_answers(paper: Paper, answers: list[dict], *, model: str) -> CleanupStats:
+def import_answers(paper: Paper, answers: list[dict], *, model: str, mode: EquationMode = "symbols",
+                   inline: EquationMode | None = None) -> CleanupStats:
     """Apply externally produced answers ([{"id", "speech"}], any order) through the same guard
     as the API pass. Re-imports are idempotent: speech is reset to the filter text first."""
-    apply_filter(paper)
-    paper.warnings = [w for w in paper.warnings if not w.startswith("clean-up:")]
-    try:
-        parsed = [_BlockSpeech.model_validate(a) for a in answers]
-    except ValidationError as exc:
-        raise ValueError(f"answers are not [{{id, speech}}] ({exc.error_count()} errors)") from exc
-    requests = plan_requests(paper)
-    run = _Run(paper, None, model, max(len(requests), 1), None, CleanupStats(model=model))
-    for request in requests:
-        ids = {b.id for b in request.blocks}
-        run._apply(request, [a for a in parsed if a.id in ids], request.section.speech_title or request.section.id)
-    paper.cleanup = run.stats
-    return run.stats
+    run = begin_import(paper, model=model, mode=mode, inline=inline)
+    apply_answers(run, run.requests, answers)
+    return finish(run)
 
 
 def cleanup_paper(paper: Paper, *, client=None, model: str = MODEL, max_workers: int = 4,
-                  progress_cb: Callable[[float, str], None] | None = None) -> CleanupStats:
+                  progress_cb: Callable[[float, str], None] | None = None,
+                  equations: EquationMode = "symbols", inline: EquationMode | None = None) -> CleanupStats:
     """Run the Haiku 5.5 clean-up over a filtered paper. Mutates blocks and sets paper.cleanup.
+    equations="meaning" reads display equations by what their symbols mean, inline="meaning" the
+    symbols inside sentences (None = like equations); see _meaning_rules and definitions.py.
 
     client: an anthropic.Anthropic (or a test double); None builds one from the environment, or
     skips the pass with skipped_reason when no credentials are available.
@@ -501,18 +929,21 @@ def cleanup_paper(paper: Paper, *, client=None, model: str = MODEL, max_workers:
     if client is None:
         ok, reason = llm_available()
         if not ok:
-            paper.cleanup = CleanupStats(model=model, skipped_reason=reason)
+            paper.cleanup = CleanupStats(model=model, skipped_reason=reason, equation_mode=equations,
+                                         inline_mode=inline or equations)
             return paper.cleanup
         client = anthropic.Anthropic()
     if any(b.speak and b.speech is None for b in paper.iter_blocks()):
         apply_filter(paper)
 
-    requests = plan_requests(paper)
-    run = _Run(paper, client, model, max(len(requests), 1), progress_cb, CleanupStats(model=model))
+    requests = plan_requests(paper, equations, inline)
+    run = _new_run(paper, client, model, requests, progress_cb, equations, inline)
     if requests:
         run.execute(requests[0])  # writes the prompt cache; parallel requests could not read it yet
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             list(pool.map(run.execute, requests[1:]))
-    run.stats.cost_usd = round(run.stats.cost_usd, 6)
-    paper.cleanup = run.stats
-    return run.stats
+    if "meaning" in (run.mode, run.inline) and not run.stopped.is_set():
+        repairs = repair_requests(run)  # blocks that named a symbol differently, asked once more
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(run.execute, repairs))
+    return finish(run)

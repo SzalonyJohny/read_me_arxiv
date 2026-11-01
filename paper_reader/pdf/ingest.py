@@ -106,14 +106,15 @@ def _noop(_fraction: float, _message: str) -> None:
 
 
 def ingest_pdf(upload_id: str, method: ExtractMethod, *, include_appendix: bool = False,
-               llm: str | None = None, progress: pipeline.Progress = _noop) -> Paper:
+               llm: str | None = None, equations: str = "meaning", inline: str = "meaning",
+               progress: pipeline.Progress = _noop) -> Paper:
     """Extract (text layer / OCR) or hand over to the arXiv path, then run the usual clean-up."""
     analysis = load_upload(upload_id)
     if method == "arxiv":
         if not analysis.arxiv_id:
             raise ValueError("no arXiv id was found in this PDF")
         return pipeline.ingest(f"https://arxiv.org/abs/{analysis.arxiv_id}", include_appendix=include_appendix,
-                               llm=llm, progress=progress)
+                               llm=llm, equations=equations, inline=inline, progress=progress)
 
     from .assemble import assemble
 
@@ -146,6 +147,7 @@ def ingest_pdf(upload_id: str, method: ExtractMethod, *, include_appendix: bool 
                      include_appendix=include_appendix, arxiv_id=analysis.arxiv_id)
     if not paper.title.strip() and analysis.title_guess:
         paper.title = analysis.title_guess
-    pipeline.run_cleanup(paper, llm, progress=pipeline.scaled_progress(progress, extract_until + 0.02, 0.99))
+    pipeline.run_cleanup(paper, llm, equations=equations, inline=inline,
+                         progress=pipeline.scaled_progress(progress, extract_until + 0.02, 0.99))
     progress(1.0, "Done")
     return paper
