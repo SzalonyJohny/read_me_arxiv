@@ -11,7 +11,7 @@ import httpx2
 import pytest
 from anthropic.types import Message, TextBlock, ThinkingBlock, Usage
 
-from paper_reader import cleanup, textfilter
+from paper_reader import cleanup, glossary, textfilter
 from paper_reader.cleanup import SYSTEM_PROMPT, cleanup_paper, guard_accepts, llm_available, plan_requests
 from paper_reader.definitions import paper_vocabulary
 from paper_reader.models import Block, Paper, Section
@@ -40,14 +40,21 @@ class FakeClient:
     """client.messages.create(**kwargs) -> Message; `answer(blocks)` decides the speech per block."""
 
     def __init__(self, answer=None, *, error: Exception | None = None, raw_text: str | None = None,
-                 stop_reason: str = "end_turn"):
+                 stop_reason: str = "end_turn", names: dict[str, str] | None = None):
         self.answer = answer or (lambda blocks: [{"id": b["id"], "speech": b["filter_speech"]} for b in blocks])
+        self.names = names or {}  # glossary stage: LaTeX as written -> name
+        self.glossary_calls: list[dict] = []
         self.error, self.raw_text, self.stop_reason = error, raw_text, stop_reason
         self.calls: list[dict] = []
         self.lock = threading.Lock()
         self.messages = self
 
     def create(self, **kwargs) -> Message:
+        if kwargs["system"][0]["text"] == glossary.SYSTEM_PROMPT:  # stage 2: the paper-wide names
+            self.glossary_calls.append(kwargs)
+            symbols = [json.loads(line) for line in kwargs["messages"][0]["content"].splitlines() if line.startswith("{")]
+            answer = [{"id": s["id"], "name": self.names[s["latex"]]} for s in symbols if s["latex"] in self.names]
+            return _message(json.dumps({"symbols": answer}))
         with self.lock:
             first = not self.calls
             self.calls.append(kwargs)
@@ -428,9 +435,69 @@ def test_a_defining_sentence_must_keep_its_symbol():
     kept = ("where A hat to the policy of s and a is an advantage function that estimates the contribution of the "
             "transition to the gradient.")
     reason = cleanup.guard_reason(block, restated, mode="meaning")
-    assert reason and '"advantage function" twice' in reason
+    assert reason and 'keep the letters "A hat to the pi theta of s and a"' in reason
     assert cleanup.guard_reason(block, kept, mode="meaning") is None
     assert cleanup.guard_reason(block, restated, mode="symbols", inline="symbols") != reason  # meaning mode only
     plural = _paragraph(r"where $\hat{Q}(s,a)$, $\hat{V}(s)$ are estimated $Q$ and value functions.")
     assert cleanup.guard_reason(plural, "where the estimated Q function and the estimated value function are "
                                         "estimated Q and value functions.", mode="meaning")
+
+
+def test_restated_definition_keeps_letters_in_that_sentence_only():
+    """SAPG b0019, asked twice and still restating: the other sentences keep their meaning reading."""
+    source = (r"where $\hat{A}(s,a)$ is an advantage function. A common choice is $\hat{A}(s,a)=\hat{Q}(s,a)-\hat{V}(s)$. "
+              r"This form of update is termed as an actor-critic update.")
+    block = _paragraph(source)
+    speech = ("where the estimated advantage function is an advantage function. A common choice is: the estimated "
+              "advantage equals the estimated Q function minus the estimated value function. This form of update "
+              "is termed as an actor-critic update.")
+    patched = cleanup.keep_letters_where_restated(block, speech)
+    assert patched.startswith("where A hat of s and a is an advantage function. A common choice is: the estimated")
+    assert patched.endswith("This form of update is termed as an actor-critic update.")
+    assert cleanup.guard_reason(block, patched, mode="meaning") is None
+    assert cleanup.keep_letters_where_restated(block, "One sentence only.") is None  # sentences don't line up
+
+
+@pytest.mark.parametrize(("text", "reads"), [
+    # SAPG b0023: a formula by meaning; symbols defined in words keep their letters
+    (r"Here, $r_{t}(\pi_{\theta})=\frac{\pi_{\theta}(a_{t}|s_{t})}{\pi_{old}(a_{t}|s_{t})}$, $\epsilon$ is a clipping "
+     r"hyperparameter and $\pi_{old}$ is the policy collecting the on-policy data.", ["meaning", "letters", "letters"]),
+    # SAPG b0019: "X = Y - Z, where Y, Z are estimated ... functions"
+    (r"A common choice is $\hat{A}=\hat{Q}-\hat{V}$, where $\hat{Q}(s,a)$, $\hat{V}(s)$ are estimated value functions.",
+     ["meaning", "letters", "letters"]),
+    # SAPG b0016: the words before name it
+    (r"The goal is to find a policy $\pi(a|s)$ which maximises the discounted reward $J(\pi)=\sum_{t}r_{t}$.",
+     ["drop", "meaning, continuing"]),
+    (r"The clipping keeps the updated $\pi$ close to $\pi_{old}$, and $\lambda$ is set to 0.5.",
+     ["meaning", "meaning", "meaning"]),
+    (r"We roll out $M$ different policies and collect $N$ samples from $\pi$.", ["letters", "letters", "meaning"]),
+    (r"Let $\mathcal{S}$ be the states, where $\mathcal{A}$ the set of actions and $\mathcal{P}$ are transition probabilities.",
+     ["meaning", "letters", "letters"]),
+])
+def test_maths_plan(text, reads):
+    short = {cleanup.FORMULA: "meaning", cleanup.FORMULA_NAMED: "meaning, continuing"}
+    assert [short.get(e["read"], e["read"]) for sentence in cleanup.maths_plan(text) for e in sentence] == reads
+
+
+def test_guard_keeps_letters_in_a_definition_and_rejects_a_repeated_phrase():
+    block = _paragraph(r"Here, $r_{t}=\frac{p(a)}{q(a)}$, and $\epsilon$ is a clipping hyperparameter.")
+    good = "Here, the probability ratio equals p of a divided by q of a, and epsilon is a clipping hyperparameter."
+    named = "Here, the probability ratio equals p of a divided by q of a, and the clipping hyperparameter is a clipping hyperparameter."
+    assert cleanup.guard_reason(block, good, mode="meaning") is None
+    assert "letters" in cleanup.guard_reason(block, named, mode="meaning")
+    renamed = "Here, the probability ratio equals p of a divided by q of a, and the clip limit is a hyperparameter of the clipping."
+    assert "keep the letters" in cleanup.guard_reason(block, renamed, mode="meaning")
+    patched = cleanup.keep_letters_where_restated(block, named)
+    assert patched == block.speech  # one sentence: the rule text, letters and all
+    twice = _paragraph(r"We seek a policy $\pi$ which maximises the long term reward $J(\pi)=\sum r$.")
+    said = "We seek a policy which maximises the long term reward the long term reward, which equals the sum of r."
+    assert "twice in a row" in cleanup.guard_reason(twice, said, mode="meaning")
+
+
+def test_a_formula_read_letter_by_letter_is_asked_again():
+    block = _paragraph(r"A common choice is $\hat{A}=\hat{Q}-\hat{V}$, where $\hat{Q}$, $\hat{V}$ are estimated $Q$ and value functions.")
+    letters = "A common choice is A hat equals Q hat minus V hat, where Q hat, V hat are estimated Q and value functions."
+    meaning = ("A common choice is: the estimated advantage equals the estimated Q function minus the estimated value "
+               "function, where Q hat, V hat are estimated Q and value functions.")  # SAPG b0019, as it should be
+    assert cleanup.guard_reason(block, letters, mode="meaning").startswith("read the formula")
+    assert cleanup.guard_reason(block, meaning, mode="meaning") is None

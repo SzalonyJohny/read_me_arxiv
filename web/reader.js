@@ -341,6 +341,7 @@ function symbolSummary(cleanup) {
   const named = Object.keys(cleanup.symbol_names ?? {}).length;
   const open = (cleanup.inconsistent_symbols ?? []).length;
   const parts = [`${named} named, each read the same way everywhere`];
+  if (cleanup.glossary_names) parts[0] = `${named} named (${cleanup.glossary_names} in a paper-wide glossary first), each read the same way everywhere`;
   if (cleanup.symbols_repaired) parts.push(`${cleanup.symbols_repaired} blocks re-asked to match`);
   if (open) parts[0] = `${named} named; ${open} still read inconsistently (see warnings)`;
   return parts.join(" · ");

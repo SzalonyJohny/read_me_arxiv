@@ -19,9 +19,15 @@ Everything runs locally on your machine. Paid services are optional, and nothing
   - Read by symbols, every display equation is read in full, symbol by symbol. Labels such as `V^{target}` or `\pi_{old}` are said as words ("V target", "pi old").
   - A guard checks every answer. It rejects paraphrases, equations described instead of read, and anything that lost a symbol, and the rejected block is asked once more with the reason. If it still fails, the rule-based text is kept.
   - **Read equations by meaning** (checkbox, on by default): with an LLM clean-up, maths can be read by what the paper defines the symbols as. For example, "r t equals omega I r t I plus omega G r t G" becomes "the reward at time step t equals the imitation weight times the imitation objective plus the task weight times the task objective".
-    - The meanings come from the paper's own definition sentences, which are found automatically and sent with each equation.
-    - Symbols used in a standard role of the field get the field's terms when the paper uses those words: π is "the policy", V "the value function", A "the advantage function", γ "the discount factor".
-    - A grounding check rejects any word the paper doesn't use, and a consistency check makes sure a symbol gets the same name in every equation.
+    - It runs in stages:
+      1. Rules list every symbol, with the sentences where the paper defines it and a few places where it is used.
+      2. The LLM names them once for the whole paper: the paper's definitions come first, then the field's standard terms, but only when the paper uses those words (π is "policy", so π_i is "policy i"; V is "value function"; γ is "discount factor").
+      3. Rules decide how each piece of maths in a sentence is read:
+         - by meaning: a formula, or a symbol in use;
+         - letters: where the sentence defines the symbol in words ("ε is a clipping hyperparameter");
+         - dropped: where the words right before it already name it ("a policy π(a|s)").
+      4. The LLM writes the narration, section by section, with those names and decisions.
+    - A grounding check rejects any word the paper doesn't use. Other checks enforce the letters decisions and reject a phrase said twice in a row. A consistency check makes sure a symbol gets the same name everywhere. A rejected answer is asked again once, with the reason.
   - **Read symbols in the text by meaning** (second checkbox, on by default): the same for maths inside sentences. For example, "the center-of-mass reward r t to the c penalizes…" becomes "the center-of-mass reward penalizes…", and a symbol on its own is read by its meaning. The sentence that defines a symbol keeps its letters, so the definition still says something.
 - **Narration**
   - **Kokoro-82M**: local, about 100× realtime on a GPU.

@@ -78,10 +78,27 @@ def atom_key(atom: Atom) -> Atom:
     return base, sup, "" if not letters or letters in _INDEX_LETTERS else sub
 
 
-def symbol_key(latex: str) -> Atom | None:
-    """The key of the first symbol in a LaTeX string (a reported symbol like "r^{I}_{t}")."""
+_APPLIED_TO = re.compile(r"\s*(?:\\left)?\(((?:[^()]|\([^()]*\))*)\)")  # used with .match(text, pos)
+
+
+def symbol_key(latex: str) -> tuple | None:
+    """The key of the first symbol in a LaTeX string (a reported symbol like "r^{I}_{t}").
+    A symbol applied to a named argument is its own symbol: r_t(\\pi_\\theta) (a ratio of policies)
+    is not r_k (a reward); plain variables as arguments (V(s), V(s_{t+1})) don't count. A prime
+    written as an apostrophe is a prime: s'_t is s^{\\prime}_t."""
+    latex = re.sub(r"'", r"^{\\prime}", latex)
     atoms = math_atom_list(latex)
-    return atom_key(atoms[0]) if atoms else None
+    if not atoms:
+        return None
+    key = atom_key(atoms[0])
+    match = _BASE.search(latex)
+    pos = match.end()
+    while script := _SCRIPT.match(latex, pos):
+        pos = script.end()
+    applied = _APPLIED_TO.match(latex, pos)
+    named = [atom_key(a) for a in math_atom_list(applied.group(1))] if applied else []
+    named = tuple(a for a in named if len(a[0]) > 1 or a[1] or a[2])  # \pi_\theta, \mathcal{X}; not s, a
+    return key + (named,) if named else key
 
 
 def math_atom_list(latex: str) -> list[Atom]:
@@ -103,6 +120,23 @@ def math_atom_list(latex: str) -> list[Atom]:
             pos = script.end()  # continue after the scripts: their letters are indices, not symbols
         atoms.append((base, sup, sub))
     return atoms
+
+
+def symbol_spans(latex: str) -> list[str]:
+    """Each symbol of a LaTeX string as written, with its scripts and, when it is applied to a named
+    argument (as symbol_key counts it), that argument: "r_{t}(\\pi_{\\theta})", "\\hat{A}^{\\pi}", "\\gamma"."""
+    spans = []
+    pos = 0
+    while match := _BASE.search(latex, pos):
+        pos = match.end()
+        while script := _SCRIPT.match(latex, pos):
+            pos = script.end()
+        end = pos
+        applied = _APPLIED_TO.match(latex, pos)
+        if applied and len(symbol_key(latex[match.start():applied.end()]) or ()) == 4:
+            end = applied.end()
+        spans.append(latex[match.start():end].strip())
+    return spans
 
 
 def _is_apposition(sentence: str) -> bool:
@@ -181,6 +215,15 @@ class DefinitionIndex:
             if atoms and (_CUE.search(_MATH.sub(" ", sentence)) or _is_apposition(sentence)):
                 self._sentences.append(_Sentence(order, sentence.strip(), atoms))
 
+    def for_symbol(self, atom: Atom, *, near: int = 0, limit: int = 2) -> list[str]:
+        """The sentences that define one symbol (exactly, else with another index), nearest first."""
+        defining = [c for c in self._sentences if max((_match(atom, a) for a in c.atoms), default=0) >= 2]
+        defining.sort(key=lambda c: (-max(_match(atom, a) for a in c.atoms), abs(c.order - near)))
+        return [c.text for c in defining[:limit]]
+
+    def position(self, block_id: str) -> int:
+        return self._order.get(block_id, 0)
+
     def for_block(self, block: Block, *, skip: tuple[str, ...] = (), max_sentences: int = MAX_DEFINITIONS,
                   max_chars: int = MAX_DEFINITION_CHARS) -> list[str]:
         """The paper's sentences that define the symbols this block uses, best first by symbol
@@ -234,4 +277,10 @@ def paper_vocabulary(paper: Paper) -> set[str]:
                 words.add(word[:-3] + "y")
             elif word.endswith("s"):
                 words.add(word[:-1])
+            for suffix in ("ing", "ed"):  # "clipping"/"clipped" -> "clip", "computed" -> "compute"
+                stem = word[: -len(suffix)]
+                if word.endswith(suffix) and len(stem) >= 3:
+                    words.update((stem, stem + "e"))
+                    if len(stem) >= 4 and stem[-1] == stem[-2] and stem[-1] not in "aeiouls":
+                        words.add(stem[:-1])
     return words | {name.lower() for name in _GREEK}

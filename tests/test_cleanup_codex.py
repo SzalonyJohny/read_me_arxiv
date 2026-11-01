@@ -7,14 +7,21 @@ import subprocess
 
 import pytest
 
-from paper_reader import cleanup_codex, pipeline
+from paper_reader import cleanup_codex, glossary, pipeline
 from tests.test_cleanup import GOOD_ANSWERS, _paper
 
 
-def _fake_codex(answers: dict[str, str], *, fail_sections: tuple[str, ...] = ()):
+def _fake_codex(answers: dict[str, str], *, fail_sections: tuple[str, ...] = (), names: dict[str, str] | None = None):
     """A stand-in for subprocess.run(["codex", "exec", ...]) that answers from `answers`."""
     def run(cmd, input, capture_output, text, timeout):
         assert cmd[:2] == ["codex", "exec"] and "--output-schema" in cmd and "read-only" in cmd
+        if glossary.SYSTEM_PROMPT in input:  # stage 2 (meaning mode): name the symbols
+            assert 'model_reasoning_effort="medium"' in cmd
+            symbols = [json.loads(line) for line in input.splitlines() if line.startswith('{"id"')]
+            with open(cmd[cmd.index("-o") + 1], "w", encoding="utf-8") as f:
+                json.dump({"symbols": [{"id": s["id"], "name": (names or {})[s["latex"]]}
+                                       for s in symbols if s["latex"] in (names or {})]}, f)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         assert cleanup_codex.RUN_RULES in input and "Return the narration" in input
         if any(f"Section: {name}" in input for name in fail_sections):
             return subprocess.CompletedProcess(cmd, 1, "", "error: model overloaded")
@@ -75,3 +82,24 @@ def test_runner_choice_in_the_pipeline(tmp_path, monkeypatch):
     assert pipeline.run_cleanup(_paper(), None).cleanup.skipped_reason == "LLM clean-up disabled"
     with pytest.raises(ValueError):
         pipeline.run_cleanup(_paper(), "gpt")
+
+
+def test_meaning_mode_names_the_symbols_first(codex_ok, monkeypatch):
+    """Stage 2 runs once before the narration, and its names travel with the blocks that use them."""
+    prompts = []
+    fake = _fake_codex({**GOOD_ANSWERS, "b0005": "Equation 4: the loss equals the sum over time steps t from 1 to T "
+                                                 "of the squared norm of x hat t minus x t, plus beta times the KL "
+                                                 "divergence between q and p."},
+                       names={"\\beta": "beta", "x_{t}": "observation"})
+
+    def recording(cmd, input, **kwargs):
+        prompts.append(input)
+        return fake(cmd, input, **kwargs)
+
+    monkeypatch.setattr(cleanup_codex.subprocess, "run", recording)
+    paper = _paper()
+    stats = cleanup_codex.cleanup_paper_codex(paper, equations="meaning")
+    assert glossary.SYSTEM_PROMPT in prompts[0]  # the glossary request comes first
+    assert stats.glossary_names == 1  # "observation" is not a word of the test paper: dropped
+    equation_request = next(p for p in prompts if '"b0005"' in p)
+    assert '"names": {' in equation_request and '"\\\\beta": "beta"' in equation_request

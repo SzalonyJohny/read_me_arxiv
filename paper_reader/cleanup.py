@@ -31,8 +31,9 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel, ValidationError
 
+from . import glossary as glossary_stage
 from . import pricing
-from .definitions import DefinitionIndex, atom_key, math_atoms, paper_vocabulary, symbol_key
+from .definitions import _NOT_A_NOUN, DefinitionIndex, _sentences, atom_key, math_atoms, paper_vocabulary, symbol_key
 from .models import Block, CleanupStats, Paper, Section
 from .textfilter import (apply_filter, equation_label, equation_reading, equation_speech, filter_text, inline_math,
                          latex_to_speech)
@@ -82,7 +83,7 @@ greater less than approximately proportional distributed according vector matrix
 divergence variance mean average probability distribution sequence tuple set index which where
 superscript subscript hat bar tilde star prime dotted dot cross conjugate magnitude elementwise
 capital uppercase lowercase calligraphic bold script blackboard
-projected projection onto
+projected projection onto map maps mapping indices matrices vertices
 hadamard concatenation concatenated composition indicator otherwise case cases condition such that per
 hertz kilohertz megahertz gigahertz second seconds milliseconds microseconds minute minutes hour hours
 meter meters centimeters millimeters kilometers kilogram kilograms grams newton newtons joules watts
@@ -187,7 +188,10 @@ else (an r_t defined as the ratio of two policies is "the probability ratio", no
 request means only what that request's definitions, context and block say: never carry a meaning \
 over from an example or another paper.
 - One name per symbol for the whole paper: a symbol is read the same way in every equation and \
-sentence. When a request gives "names" (symbol -> name), use exactly those names.
+sentence. Blocks may carry "names" (symbol -> name): the paper-wide name of each of their symbols, \
+decided beforehand from the whole paper. Use exactly those names, with "the" and with the symbol's \
+own indices: "policy" for $\\pi_{i}$ is read "policy i", "state" for $s_{t}$ "the state at time step \
+t". Only a sentence that defines a symbol in words keeps its letters there.
 - For every block also return "symbols": each symbol you named by meaning, as {"latex": the bare \
 symbol, "name": the name you said, without "the" and without its indices}, for example \
 {"latex": "r^{I}_{t}", "name": "imitation objective"}. Leave it empty when you named none."""
@@ -200,11 +204,19 @@ for a long equation)."""
 _MEANING_INLINE = """- Symbols inside sentences (instead of rule 2): read a defined symbol by its meaning, inside \
 the sentence's own words; the rest of the sentence stays word for word. When the words right \
 before the symbol already name it ("the slip penalty $\\kappa_{t}$"), drop the symbol instead of \
-saying the name twice. But in the sentence that defines a symbol ("$u_{t}$ denotes the foot speed", \
-"with $u_{t}$ being ...", "where $u_{t}$ is ..."), keep the symbol's spoken letters, also for a \
-symbol with a standard name in the field: replacing it there would make the definition say "the \
-foot speed denotes the foot speed". A bracketed list of \
-words ("$e \\in$ [left foot, right foot]") is a set, read "one of left foot, right foot", not an interval."""
+saying the name twice. But where a sentence defines a symbol IN WORDS ("$u_{t}$ denotes the foot \
+speed", "with $u_{t}$ being ...", "where $u_{t}$ is ...", "$Q$ and $V$ are estimated Q and value \
+functions"), keep that symbol's spoken letters there, also for a symbol with a standard name in the \
+field: replacing it would make the definition say "the foot speed denotes the foot speed". A symbol \
+defined BY A FORMULA ("$w_{t}=\\frac{p(x_{t})}{q(x_{t})}$") is read by meaning on both sides, like a \
+display equation. One sentence can hold both: the formula by meaning, the "where ... is ..." part \
+with letters. A bracketed list of \
+words ("$e \\in$ [left foot, right foot]") is a set, read "one of left foot, right foot", not an interval.
+- Prose blocks may carry "maths": for each piece of inline maths in order, how to read it, decided \
+by rules from the sentence. "meaning": by its name. "letters": the sentence defines it in words, so \
+say exactly the given "letters" there. "drop": the words right before it already name it, so leave \
+the symbol out and do not repeat those words. "meaning, continuing": a formula whose left side the \
+words before it already name; go on with "which equals ..." by meaning. Follow these decisions."""
 _SYMBOLS_EQUATIONS = "- Display equations are read as rule 3 says, symbol by symbol."
 _SYMBOLS_INLINE = "- Symbols inside sentences are read as rule 2 says, symbol by symbol."
 _MEANING_SCOPE = {("meaning", "meaning"): "equations and the symbols inside sentences",
@@ -402,6 +414,24 @@ _EXAMPLES = [
              mode="meaning",
              definitions=("The policy is a neural network with parameters theta.",),
              symbols=((r"\pi_{\theta}", "policy"),)),
+    _Example("Symbols in sentences: a formula is read by meaning, a definition in words keeps the letters",
+             r"Here, $w_{t}=\frac{p_{\phi}(x_{t})}{q(x_{t})}$, and $\eta$ is a step size.",
+             "Here, the importance weight at time step t equals the probability of the observation at time "
+             "step t under the model divided by its probability under the proposal, and eta is a step size.",
+             mode="meaning",
+             definitions=(r"The importance weight $w_{t}$ corrects, at every time step, for sampling the observation "
+                          r"$x_{t}$ from the proposal $q$ instead of the model $p_{\phi}$.",),
+             symbols=(("w_{t}", "importance weight"), ("x_{t}", "observation"), (r"p_{\phi}", "model"), ("q", "proposal"))),
+    _Example("Symbols in sentences: the same sentence can hold both kinds",
+             r"A common estimate is $\hat{G}_{t}=r_{t}+\gamma\hat{V}(s_{t+1})$, where $\hat{V}(s)$ is a learned "
+             r"value function.",
+             "A common estimate is: the estimated return at time step t equals the reward at time step t plus the "
+             "discount factor times the estimated value of the next state, where V hat of s is a learned value function.",
+             mode="meaning",
+             definitions=(r"The agent receives the reward $r_{t}$ at every time step, future rewards are weighted by "
+                          r"the discount factor $\gamma$, and $\hat{G}_{t}$ is the estimated return from the next state on.",),
+             symbols=((r"\hat{G}_{t}", "estimated return"), ("r_{t}", "reward"), (r"\gamma", "discount factor"),
+                      (r"\hat{V}", "estimated value"))),
     _Example("Meaning mode: inline maths inside a sentence",
              r"For all tasks we set $\lambda_{1}=1.0$ and $\lambda_{2}=0.05$.",
              "For all tasks we set the tracking weight to 1.0 and the torque weight to 0.05.",
@@ -525,7 +555,8 @@ def _neighbour_text(blocks: list[Block], start: int, step: int) -> str:
 
 
 def _block_payload(section: Section, index: int, definitions: DefinitionIndex | None = None,
-                   mode: EquationMode = "meaning", inline: EquationMode | None = None) -> dict:
+                   mode: EquationMode = "meaning", inline: EquationMode | None = None,
+                   glossary: dict | None = None) -> dict:
     """One block as the model sees it. With a DefinitionIndex, blocks whose maths is read by meaning
     (equations when mode is "meaning", sentences when inline is) carry the paper's definitions."""
     inline = inline or mode
@@ -543,11 +574,21 @@ def _block_payload(section: Section, index: int, definitions: DefinitionIndex | 
         found = definitions.for_block(block, **DEFINITIONS_FOR_PROSE) if by_meaning else []
     if found:
         payload["definitions"] = found
+    by_meaning = mode == "meaning" if block.type == "equation" else inline == "meaning"
+    if by_meaning and block.type != "equation" and "$" in (block.text or ""):
+        spans = [entry for sentence in maths_plan(block.text) for entry in sentence]
+        if any(e["read"] != "meaning" for e in spans):
+            payload["maths"] = spans
+    if glossary and by_meaning:
+        latex = block.latex if block.type == "equation" else " ".join(inline_math(block.text or ""))
+        if names := glossary_stage.names_for(latex or "", glossary):
+            payload["names"] = names
     payload["filter_speech"] = block.speech or ""
     return payload
 
 
-def plan_requests(paper: Paper, mode: EquationMode = "symbols", inline: EquationMode | None = None) -> list[CleanupRequest]:
+def plan_requests(paper: Paper, mode: EquationMode = "symbols", inline: EquationMode | None = None,
+                  glossary: dict | None = None) -> list[CleanupRequest]:
     """One request per section, split into chunks of at most MAX_CHUNK_CHARS of block JSON."""
     inline = inline or mode
     definitions = DefinitionIndex(paper) if "meaning" in (mode, inline) else None
@@ -559,7 +600,7 @@ def plan_requests(paper: Paper, mode: EquationMode = "symbols", inline: Equation
         for index, block in enumerate(section.blocks):
             if not block.speak or block.type == "figure" or not (block.speech or block.type == "equation"):
                 continue
-            payload = _block_payload(section, index, definitions, mode, inline)
+            payload = _block_payload(section, index, definitions, mode, inline, glossary)
             length = len(json.dumps(payload, ensure_ascii=False))
             if chunk and size + length > MAX_CHUNK_CHARS:
                 requests.append(_request(paper, section, heading, chunk))
@@ -622,9 +663,92 @@ def _restated_names(text: str) -> set[str]:
     for sentence in re.split(r"[.;:?!]", text.lower()):
         words = re.findall(r"[a-z0-9]+", sentence)
         for i, word in enumerate(words):
-            if word in _COPULAS:
-                found |= {" ".join(pair) for pair in _content_bigrams(words[:i]) & _content_bigrams(words[i + 1:i + 8])}
+            if word in _COPULAS:  # the subject right before "is" against what follows it
+                found |= {" ".join(pair) for pair in _content_bigrams(words[max(0, i - 6):i]) & _content_bigrams(words[i + 1:i + 8])}
     return found
+
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
+
+# ---------------------------------------------------------------- how each piece of inline maths is read
+# Reading symbols in sentences by meaning has three cases, and a model at low effort mixes them up
+# from run to run. So rules decide, per $...$ span, and the request says it ("maths"):
+#   meaning  - a formula, or a symbol used in a sentence: "the updated $\pi$" -> "the updated policy";
+#   letters  - the sentence defines it in words: "$\epsilon$ is a clipping hyperparameter" (else it would
+#              say "the clipping hyperparameter is a clipping hyperparameter");
+#   drop     - the words right before it name it: "a policy $\pi(a|s)$ which ..." -> "a policy which ...".
+_DEFINED_HERE = re.compile(
+    r"\s*(?:,\s*(?:and\s+)?\$[^$]+\$\s*)*(?:,?\s*and\s+\$[^$]+\$\s*)?,?\s*"
+    r"(?:(?:is|are)\s+(?:a|an|the|our|its|their|some|estimated|defined|called|used\s+as)\b|"
+    r"(?:is|are)\s+(?!set\s+to\b)(?:[\w-]+\s+){0,2}(?:functions?|probabilit\w*|distributions?|parameters?|weights?|coefficients?|"
+    r"matri(?:x|ces)|vectors?|sets?|spaces?|loss(?:es)?|rewards?|values?|estimates?|polic(?:y|ies)|terms?)\b|denotes?\b|"
+    r"represents?\b|refers?\s+to\b|stands?\s+for\b|being\b|(?:the|a|an)\s)", re.IGNORECASE)
+_NAMED_BEFORE = re.compile(r"\b(?:the|a|an|our|its|their|each|every)\s+(?:[\w-]+\s+){0,4}([\w-]+)\s*$", re.IGNORECASE)
+_NOT_A_NAME = _NOT_A_NOUN | set("""current new old same optimal initial final learned true estimated corresponding
+given following previous next best other updated trained resulting proposed""".split())
+_SPAN = re.compile(r"\$([^$]+)\$")
+_COUNT = re.compile(r"\s+(?:[a-z-]+\s+)?[a-z-]{3,}s\b")  # "$M$ different policies", "$N$ environments"
+FORMULA = "meaning: a formula, every symbol in it by its name (also one the sentence then defines in words)"
+FORMULA_NAMED = ("meaning, continuing: a formula whose left side the words before it already name; do not name "
+                 "it again, go on with \"which equals ...\" and every other symbol by its name")
+
+
+def maths_plan(text: str) -> list[list[dict]]:
+    """Per sentence of a prose block, how each of its $...$ spans is read: {"latex", "read"} with read
+    "meaning", "letters" (plus the "letters" to say), "drop", or "meaning, continuing" (a formula whose
+    left side the words before it already name: "the return $J = ...$" -> "the return, which equals ...")."""
+    plan = []
+    for sentence in _sentences(text or ""):
+        spans = []
+        for match in _SPAN.finditer(sentence):
+            latex, before, after = match.group(1), sentence[:match.start()], sentence[match.end():]
+            named = _NAMED_BEFORE.search(before)
+            is_named = bool(named) and named.group(1).lower() not in _NOT_A_NAME and not named.group(1).lower().endswith("ed")
+            if "=" in latex:
+                read = FORMULA_NAMED if is_named else FORMULA
+            elif re.fullmatch(r"\s*[A-Za-z]\s*", latex) and _COUNT.match(after):
+                read = "letters"  # a count: "M different policies", not "the number of policies different policies"
+            elif _DEFINED_HERE.match(after):
+                read = "letters"
+            elif is_named:
+                read = "drop"
+            else:
+                read = "meaning"
+            entry = {"latex": latex, "read": read}
+            if read == "letters":
+                entry["letters"] = latex_to_speech(latex)
+            spans.append(entry)
+        plan.append(spans)
+    return plan
+
+
+def _missing_letters(sentence_plan: list[dict], speech: str) -> list[str]:
+    """The letters a sentence must say (it defines those symbols in words) that its reading lacks."""
+    spoken = " ".join(re.findall(r"[a-z0-9]+", speech.lower()))
+    missing = []
+    for entry in sentence_plan:
+        if entry["read"] == "letters":
+            head = " ".join(re.findall(r"[a-z0-9]+", entry["letters"].lower())[:2])
+            if head and f" {head} " not in f" {spoken} ":
+                missing.append(entry["letters"])
+    return missing
+
+
+_REPEATED = re.compile(r"\b((?:[a-z-]+\s+){2,7}[a-z-]+)[\s,]+\1\b")
+
+
+def keep_letters_where_restated(block: Block, speech: str) -> str | None:
+    """A reading rejected only because a defining sentence says a symbol's name twice: the reading
+    with just those sentences taken from the rule text (which says the letters), when the sentences
+    of the two line up one to one. None when they don't."""
+    filtered = block.speech if block.speech is not None else filter_text(block.text)
+    ours, rules = _SENTENCE_SPLIT.split(speech.strip()), _SENTENCE_SPLIT.split(filtered.strip())
+    plan = maths_plan(block.text)
+    if len(ours) != len(rules):
+        return None
+    plan = plan if len(plan) == len(ours) else [[] for _ in ours]
+    return " ".join(rule if _restated_names(own) - _restated_names(rule) or _missing_letters(spans, own) else own
+                    for own, rule, spans in zip(ours, rules, plan))
 
 
 def _symbol_words(text: str) -> Counter:
@@ -668,6 +792,20 @@ def guard_reason(block: Block, speech: str, *, mode: EquationMode = "symbols", i
         if restated:
             return (f'says "{sorted(restated)[0]}" twice in the sentence that defines it: keep the symbol\'s '
                     f"letters in a defining sentence")
+        missing = [letters for spans in maths_plan(block.text) for letters in _missing_letters(spans, speech)]
+        if missing:
+            return f'keep the letters "{missing[0]}" in the sentence that defines that symbol in words'
+        repeated = set(_REPEATED.findall(speech.lower())) - set(_REPEATED.findall(filtered.lower()))
+        if repeated:
+            return f'says "{sorted(repeated)[0]}" twice in a row'
+        spoken = " ".join(re.findall(r"[a-z0-9]+", speech.lower()))
+        for entry in (e for spans in maths_plan(block.text) for e in spans if e["read"] in (FORMULA, FORMULA_NAMED)):
+            words = re.findall(r"[a-z0-9]+", latex_to_speech(entry["latex"]).lower())
+            if "equals" not in words:
+                continue
+            letters = " ".join(words[: words.index("equals") + 3])  # the formula itself, read letter by letter
+            if f" {letters} " in f" {spoken} ":
+                return f'read the formula "{latex_to_speech(entry["latex"])[:60]}" by meaning, not letter by letter'
     if block.type == "equation":
         words = len(speech.split())
         if by_meaning:
@@ -727,6 +865,7 @@ class _Run:
     requests: list[CleanupRequest] = field(default_factory=list)
     uses: dict[str, list[_SymbolName]] = field(default_factory=dict)  # block id -> names its reading used
     rejected: dict[str, str] = field(default_factory=dict)  # block id -> why the guard rejected its answer
+    glossary: dict = field(default_factory=dict)  # symbol key -> (LaTeX, paper-wide name), meaning mode
     lock: threading.Lock = field(default_factory=threading.Lock)
     stopped: threading.Event = field(default_factory=threading.Event)
     done: int = 0
@@ -797,9 +936,24 @@ class _Run:
                     self.rejected.pop(block.id, None)
             elif block.speech_source == "llm":
                 log.info("clean-up: %s keeps its earlier reading; the repair was rejected: %s", block.id, reason)
+            elif block.id in self.rejected and reason.startswith("read the formula"):
+                # asked twice and still letter by letter: correct, only less helpful, so it stays
+                block.speech, block.speech_source = speech, "llm"
+                with self.lock:
+                    self.uses[block.id] = answer.symbols
+                    self.rejected.pop(block.id, None)
+            elif (block.id in self.rejected and reason.startswith(("says ", "keep the letters"))
+                  and (patched := keep_letters_where_restated(block, speech))
+                  and guard_reason(block, patched, mode=self.mode, inline=self.inline, vocabulary=self.vocabulary) is None):
+                # asked twice and still restating: keep the reading, with letters in those sentences only
+                block.speech, block.speech_source = patched, "llm"
+                with self.lock:
+                    self.uses[block.id] = answer.symbols
+                    self.rejected.pop(block.id, None)
+                log.info("clean-up: %s kept the rule text in its defining sentence(s) only", block.id)
             else:
                 block.speech_source = "llm_rejected"
-                if block.type == "equation" and self.mode == "symbols":
+                if block.type == "equation":
                     # the filter says only "Equation 4." for a long equation: read it in full instead
                     block.speech = equation_reading(block) or block.speech
                 with self.lock:
@@ -853,7 +1007,8 @@ class ConsistencyReport:
 
 
 def check_consistency(uses: dict[str, list[_SymbolName]], speeches: dict[str, str],
-                      order: list[str], equations: set[str] | None = None) -> ConsistencyReport:
+                      order: list[str], equations: set[str] | None = None,
+                      preferred: dict | None = None) -> ConsistencyReport:
     """The same symbol must be read the same way in every block. A block fails when it reported a
     different name for a symbol, or (display equations, whose reading is built from the symbols)
     when its speech doesn't actually say the canonical name. Prose keeps the paper's own words, so
@@ -875,6 +1030,8 @@ def check_consistency(uses: dict[str, list[_SymbolName]], speeches: dict[str, st
             shown[key] = min(shown.get(key, (at, symbol.latex)), (at, symbol.latex))
     # the most used name wins; a tie goes to the name used first in reading order
     canonical = {key: max(names, key=lambda n: (names[n], -first_use[key, n])) for key, names in counts.items()}
+    for key in canonical.keys() & (preferred or {}).keys():  # decided for the whole paper beforehand
+        canonical[key] = preferred[key]
     issues = []
     for block_id in sorted(uses, key=lambda b: position.get(b, 1 << 30)):
         spoken = re.sub(r"[^a-z0-9]+", " ", speeches.get(block_id, "").lower())
@@ -892,8 +1049,9 @@ def check_consistency(uses: dict[str, list[_SymbolName]], speeches: dict[str, st
 
 def consistency(run: "_Run") -> ConsistencyReport:
     blocks = list(run.paper.iter_blocks())
+    preferred = {key: normalize_name(name) for key, (_, name) in run.glossary.items()}
     return check_consistency(run.uses, {b.id: b.speech or "" for b in blocks}, [b.id for b in blocks],
-                             equations={b.id for b in blocks if b.type == "equation"})
+                             equations={b.id for b in blocks if b.type == "equation"}, preferred=preferred)
 
 
 def repair_requests(run: "_Run") -> list[CleanupRequest]:
@@ -913,12 +1071,13 @@ def repair_requests(run: "_Run") -> list[CleanupRequest]:
         for index, block in enumerate(section.blocks):
             if block.id not in flagged:
                 continue
-            payload = _block_payload(section, index, definitions, run.mode, run.inline)
+            payload = _block_payload(section, index, definitions, run.mode, run.inline, run.glossary)
             if report:
                 latex = block.latex if block.type == "equation" else " ".join(inline_math(block.text))
                 keys = {symbol_key(x.latex) for x in run.uses.get(block.id, [])}
                 keys |= {atom_key(a) for a in math_atoms(latex or "")}
-                payload["names"] = {report.shown[k]: report.names[k] for k in report.names if k in keys}
+                payload["names"] = payload.get("names", {}) | {
+                    report.shown[k]: report.names[k] for k in report.names if k in keys}
             if block.id in run.rejected:
                 payload["problem"] = f"your previous answer was rejected: {run.rejected[block.id]}"
             payloads.append(payload)
@@ -957,12 +1116,46 @@ def finish(run: "_Run") -> CleanupStats:
 
 
 def begin_import(paper: Paper, *, model: str, mode: EquationMode = "symbols",
-                 inline: EquationMode | None = None) -> "_Run":
-    """A pass whose answers come from outside (Codex, subagents): filter text reset, requests planned."""
+                 inline: EquationMode | None = None, glossary: dict | None = None) -> "_Run":
+    """A pass whose answers come from outside (Codex, subagents): filter text reset, requests planned
+    (with the glossary's names, when there is one)."""
     apply_filter(paper)
     paper.warnings = [w for w in paper.warnings if not w.startswith("clean-up:")]
-    requests = plan_requests(paper, mode, inline)
-    return _new_run(paper, None, model, requests, None, mode, inline)
+    requests = plan_requests(paper, mode, inline, glossary)
+    run = _new_run(paper, None, model, requests, None, mode, inline)
+    run.glossary = glossary or {}
+    run.stats.glossary_names = len(run.glossary)
+    return run
+
+
+def accept_glossary(paper: Paper, answers: list[dict], symbols: list) -> dict:
+    """Glossary answers through their checks (short plain names, grounded in the paper's words)."""
+    vocabulary = paper_vocabulary(paper)
+    names, dropped = glossary_stage.accept(symbols, answers, vocabulary,
+                                           lambda name: _ungrounded(name, "", vocabulary))
+    if dropped:
+        log.info("glossary: dropped %d name(s): %s", len(dropped), "; ".join(dropped[:8]))
+    return names
+
+
+def _glossary_api(run: "_Run") -> dict:
+    """Stage 2 through the Messages API: one request per group of symbols."""
+    symbols = glossary_stage.inventory(run.paper)
+    answers: list[dict] = []
+    for message in glossary_stage.requests(run.paper, symbols):
+        try:
+            response = run.client.messages.create(
+                model=run.model, max_tokens=MAX_OUTPUT_TOKENS,
+                system=[{"type": "text", "text": glossary_stage.SYSTEM_PROMPT}],
+                messages=[{"role": "user", "content": message}],
+                output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": glossary_stage.SCHEMA}},
+            )
+            run._account(response.usage)
+            text = next((b.text for b in response.content if b.type == "text"), "{}")
+            answers += json.loads(text).get("symbols", [])
+        except (anthropic.APIError, json.JSONDecodeError, AttributeError) as exc:
+            log.warning("glossary request failed: %s; naming symbols per section instead", exc)
+    return accept_glossary(run.paper, answers, symbols)
 
 
 def apply_answers(run: "_Run", requests: list[CleanupRequest], answers: list[dict]) -> None:
@@ -1054,8 +1247,14 @@ def cleanup_paper(paper: Paper, *, client=None, model: str = MODEL, max_workers:
     if any(b.speak and b.speech is None for b in paper.iter_blocks()):
         apply_filter(paper)
 
-    requests = plan_requests(paper, equations, inline)
-    run = _new_run(paper, client, model, requests, progress_cb, equations, inline)
+    run = _new_run(paper, client, model, [], progress_cb, equations, inline)
+    if "meaning" in (run.mode, run.inline):
+        if progress_cb:
+            progress_cb(0.0, "Naming the symbols for the whole paper")
+        run.glossary = _glossary_api(run)
+        run.stats.glossary_names = len(run.glossary)
+    requests = plan_requests(paper, equations, inline, run.glossary)
+    run.requests, run.total = requests, max(len(requests), 1)
     if requests:
         run.execute(requests[0])  # writes the prompt cache; parallel requests could not read it yet
         with ThreadPoolExecutor(max_workers=max_workers) as pool:

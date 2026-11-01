@@ -21,11 +21,13 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from . import cleanup
+from . import glossary as glossary_stage
 from .cleanup import EquationMode, _Answer, system_prompt
 from .models import CleanupStats, Paper
 
 CODEX_MODEL = "gpt-6-luna"
 CODEX_EFFORT = "low"
+GLOSSARY_EFFORT = "medium"  # one or two requests per paper, and every name depends on them
 TIMEOUT_SECONDS = 300
 RUN_RULES = ("You are running non-interactively as a text transformer. Do not run commands, read files "
              "or use tools. Reply with the JSON object only.")
@@ -41,11 +43,8 @@ def codex_available() -> tuple[bool, str | None]:
     return True, None
 
 
-def _run_request(request: dict, schema: Path, workdir: Path, model: str, effort: str,
-                 mode: EquationMode = "symbols", inline: EquationMode | None = None) -> tuple[list[dict], dict]:
-    """One `codex exec` run -> (answers, usage)."""
-    out = workdir.parent / f"answer_{request['request_id']}.json"
-    prompt = f"{system_prompt(mode, inline)}\n\n---\n\n{RUN_RULES}\n\n{request['user_message']}"
+def _codex(prompt: str, schema: Path, out: Path, workdir: Path, model: str, effort: str) -> tuple[str, dict]:
+    """One `codex exec` run -> (final message, usage)."""
     cmd = ["codex", "exec", "-m", model, "-c", f'model_reasoning_effort="{effort}"', "-s", "read-only",
            "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--output-schema", str(schema),
            "-o", str(out), "--json", "-C", str(workdir), "-"]
@@ -53,15 +52,50 @@ def _run_request(request: dict, schema: Path, workdir: Path, model: str, effort:
     if proc.returncode != 0 or not out.exists():
         detail = (proc.stderr.strip().splitlines() or ["no output"])[-1]
         raise RuntimeError(f"codex exited with {proc.returncode}: {detail[:300]}")
-    try:
-        answers = _Answer.model_validate_json(out.read_text(encoding="utf-8")).blocks
-    except ValidationError as exc:
-        raise RuntimeError(f"the answer is not the expected JSON ({exc.error_count()} errors)") from exc
     usage: dict = {}
     for line in proc.stdout.splitlines():
         if '"turn.completed"' in line:
             usage = json.loads(line).get("usage") or {}
+    return out.read_text(encoding="utf-8"), usage
+
+
+def _run_request(request: dict, schema: Path, workdir: Path, model: str, effort: str,
+                 mode: EquationMode = "symbols", inline: EquationMode | None = None) -> tuple[list[dict], dict]:
+    """One narration request -> (answers, usage)."""
+    out = workdir.parent / f"answer_{request['request_id']}.json"
+    prompt = f"{system_prompt(mode, inline)}\n\n---\n\n{RUN_RULES}\n\n{request['user_message']}"
+    text, usage = _codex(prompt, schema, out, workdir, model, effort)
+    try:
+        answers = _Answer.model_validate_json(text).blocks
+    except ValidationError as exc:
+        raise RuntimeError(f"the answer is not the expected JSON ({exc.error_count()} errors)") from exc
     return [a.model_dump() for a in answers], usage
+
+
+def _glossary(paper: Paper, tmp: Path, workdir: Path, model: str, max_workers: int,
+              tokens: dict, errors: list[str]) -> dict:
+    """Stage 2: the paper-wide name of every symbol, before any narration request."""
+    schema = tmp / "glossary_schema.json"
+    schema.write_text(json.dumps(glossary_stage.SCHEMA), encoding="utf-8")
+    symbols = glossary_stage.inventory(paper)
+
+    def one(item):
+        i, message = item
+        prompt = f"{glossary_stage.SYSTEM_PROMPT}\n\n---\n\n{RUN_RULES}\n\n{message}"
+        try:
+            text, usage = _codex(prompt, schema, tmp / f"glossary_{i}.json", workdir, model, GLOSSARY_EFFORT)
+            return json.loads(text).get("symbols", []), usage
+        except (RuntimeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+            errors.append(f"glossary: {exc}")
+            return [], {}
+
+    answers: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for found, usage in pool.map(one, enumerate(glossary_stage.requests(paper, symbols))):
+            answers += found
+            for key in tokens:
+                tokens[key] += int(usage.get(key) or 0)
+    return cleanup.accept_glossary(paper, answers, symbols)
 
 
 def cleanup_paper_codex(paper: Paper, *, model: str = CODEX_MODEL, effort: str = CODEX_EFFORT,
@@ -77,14 +111,20 @@ def cleanup_paper_codex(paper: Paper, *, model: str = CODEX_MODEL, effort: str =
                                      inline_mode=inline or equations)
         return paper.cleanup
 
-    run = cleanup.begin_import(paper, model=label, mode=equations, inline=inline)  # same requests and guard
     errors: list[str] = []
     tokens = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
     with tempfile.TemporaryDirectory(prefix="paper-reader-codex-") as tmp:
-        schema = Path(tmp) / "schema.json"
-        schema.write_text(json.dumps(cleanup.response_schema(run.mode, run.inline)), encoding="utf-8")
         workdir = Path(tmp) / "work"
         workdir.mkdir()
+        names = None
+        if "meaning" in (equations, inline or equations):
+            if progress_cb:
+                progress_cb(0.0, "Naming the symbols for the whole paper")
+            cleanup.apply_filter(paper)
+            names = _glossary(paper, Path(tmp), workdir, model, max_workers, tokens, errors)
+        run = cleanup.begin_import(paper, model=label, mode=equations, inline=inline, glossary=names)  # same requests and guard
+        schema = Path(tmp) / "schema.json"
+        schema.write_text(json.dumps(cleanup.response_schema(run.mode, run.inline)), encoding="utf-8")
 
         def ask(requests: list, first_id: int, label_prefix: str) -> tuple[list[dict], int]:
             """Run the requests through codex; returns the answers and how many requests failed."""

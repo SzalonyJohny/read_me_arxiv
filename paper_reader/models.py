@@ -88,6 +88,7 @@ class CleanupStats(BaseModel):
     symbol_names: dict[str, str] = Field(default_factory=dict)
     inconsistent_symbols: list[str] = Field(default_factory=list)
     symbols_repaired: int = 0  # blocks re-asked because they named a symbol differently
+    glossary_names: int = 0  # symbols named once for the whole paper before narration (meaning mode)
 
 
 class Reference(BaseModel):

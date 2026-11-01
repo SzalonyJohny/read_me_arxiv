@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from paper_reader import cleanup
 from paper_reader.cleanup import _SymbolName as Sym
 from paper_reader.cleanup import check_consistency, normalize_name
@@ -131,3 +133,38 @@ def test_says_name_ignores_word_order_but_not_different_words():
     assert says_name("imitation weight", "the weight for imitation times the objective")
     assert not says_name("imitation weight", "the imitation coefficient times the objective")
     assert says_name("end effector weight", "the end effector weights")  # word forms
+
+
+@pytest.mark.parametrize(("a", "b", "same"), [
+    (r"r_{t}(\pi_{\theta})", r"r_k", False),  # SAPG: the probability ratio is not the reward
+    (r"V_{\pi_i}(s)", r"V_{\pi_i}(s_{t+1})", True),  # plain variables as arguments don't matter
+    (r"s'_t", r"s^{\prime}_{t+1}", True),  # an apostrophe is a prime
+    (r"s'_t", r"s_t", False),
+])
+def test_symbol_keys(a, b, same):
+    from paper_reader.definitions import symbol_key
+    assert (symbol_key(a) == symbol_key(b)) is same
+
+
+def test_glossary_names_reach_every_block_and_win_the_consistency_check():
+    """Stage 2: one name per symbol for the whole paper, decided before the narration requests."""
+    seen = {}
+
+    def answer(blocks):
+        for b in blocks:
+            seen[b["id"]] = b.get("names")
+        return [{"id": b["id"], "speech": "Equation 3: the imitation weight equals 0.7." if b["id"] == "b0004" else b["filter_speech"],
+                 "symbols": [{"latex": r"\omega^{I}", "name": "imitation weight"}] if b["id"] == "b0004" else []}
+                for b in blocks]
+
+    paper = _paper()
+    client = FakeClient(answer, names={r"\omega^{I}": "imitation weight", r"r^{I}_{t}": "imitation objective",
+                                       r"\bar{r}": "average reward of the policy"})  # "policy": not in the paper
+    stats = cleanup.cleanup_paper(paper, client=client, equations="meaning")
+    assert len(client.glossary_calls) == 1
+    asked = client.glossary_calls[0]["messages"][0]["content"]
+    assert r"\omega^{I}" in asked and "the imitation weight" in asked  # its definition goes along
+    assert seen["b0002"] == {r"\omega^{I}": "imitation weight", r"r^{I}_{t}": "imitation objective"}
+    assert seen["b0004"] == {r"\omega^{I}": "imitation weight"}
+    assert stats.glossary_names == 2  # the ungrounded name was dropped
+    assert stats.symbol_names == {r"\omega^{I}": "imitation weight"} and stats.inconsistent_symbols == []
