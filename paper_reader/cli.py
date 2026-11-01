@@ -166,6 +166,18 @@ def cmd_cleanup_import(args) -> None:
             print(f"  {w}")
 
 
+def cmd_references(args) -> None:
+    ids = args.paper_ids or [p["paper_id"] for p in pipeline.list_papers() if p.get("source", "arxiv-html") == "arxiv-html"]
+    for paper_id in ids:
+        try:
+            result = pipeline.add_references(paper_id)
+        except (ValueError, OSError) as exc:
+            print(f"{paper_id}: skipped ({exc})")
+            continue
+        print(f"{paper_id}: {result['references']} references, {result['linked']} blocks/captions linked"
+              + (f", {result['skipped']} changed since (left as they are)" if result["skipped"] else ""))
+
+
 def cmd_delete(args) -> None:
     paper = pipeline.load_paper(args.paper_id)
     if not args.yes:
@@ -235,6 +247,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--model", default="claude-haiku (Claude Code subagent)")
     _add_equations_arg(p)
     p.set_defaults(func=cmd_cleanup_import)
+
+    p = sub.add_parser("references", help="add the bibliography to papers ingested before it was kept "
+                                           "(citation titles in the reader); clean-up and narration stay")
+    p.add_argument("paper_ids", nargs="*", help="default: every paper read from arXiv HTML")
+    p.set_defaults(func=cmd_references)
 
     p = sub.add_parser("delete", help="remove a paper and everything stored for it")
     p.add_argument("paper_id")

@@ -11,7 +11,7 @@ import httpx2
 import pytest
 from anthropic.types import Message, TextBlock, ThinkingBlock, Usage
 
-from paper_reader import cleanup
+from paper_reader import cleanup, textfilter
 from paper_reader.cleanup import SYSTEM_PROMPT, cleanup_paper, guard_accepts, llm_available, plan_requests
 from paper_reader.definitions import paper_vocabulary
 from paper_reader.models import Block, Paper, Section
@@ -84,7 +84,7 @@ GOOD_ANSWERS = {
     "b0001": "Unlike earlier work, which relies on motion capture, we estimate the state on board.",
     "b0002": "We set alpha to 0.5 and gamma to 0.99 in all experiments, see Figure 2.",
     "b0004": "We train the world model by minimizing a reconstruction loss and a KL term:",
-    "b0005": "Equation 4: the loss L is the squared error between x hat t and x t, summed over time steps, "
+    "b0005": "Equation 4: L equals the sum from t equals 1 to T of the squared norm of x hat t minus x t, "
              "plus beta times the KL divergence between q and p.",
     "b0006": "The policy transfers to the real robot.",  # a summary: must be rejected
 }
@@ -109,14 +109,17 @@ def test_cleanup_applies_guarded_answers_and_accounts_usage():
     assert blocks["b0003"].speech is None  # figures are never sent
     assert (stats.blocks_llm, stats.blocks_rejected) == (4, 1)
 
-    assert len(client.calls) == 2  # one request per section
-    assert (stats.input_tokens, stats.output_tokens) == (800, 240)
-    assert (stats.cache_creation_input_tokens, stats.cache_read_input_tokens) == (3000, 3000)
-    expected = (800 * 0.10 + 3000 * 1.25 * 0.10 + 3000 * 0.1 * 0.10 + 240 * 0.50) / 1e6
+    assert len(client.calls) == 3  # one request per section, then the rejected b0006 asked once more
+    repair = _blocks_in(client.calls[2])
+    assert [b["id"] for b in repair] == ["b0006"] and "Figure/Table mention was lost" in repair[0]["problem"]
+    assert sum("b0006 kept the rule-based text" in w for w in paper.warnings) == 1  # warned once, at the end
+    assert (stats.input_tokens, stats.output_tokens) == (1200, 360)
+    assert (stats.cache_creation_input_tokens, stats.cache_read_input_tokens) == (3000, 6000)
+    expected = (1200 * 0.10 + 3000 * 1.25 * 0.10 + 6000 * 0.1 * 0.10 + 360 * 0.50) / 1e6
     assert stats.cost_usd == pytest.approx(expected, abs=1e-6)
     assert stats.model == "claude-haiku-5-5" and stats.skipped_reason is None
     assert paper.cleanup is stats
-    assert progress == [0.5, 1.0]
+    assert progress == [0.5, 1.0, 1.0]
 
 
 def test_request_shape():
@@ -144,12 +147,16 @@ def test_long_sections_are_chunked(monkeypatch):
     assert [[b.id for b in r.blocks] for r in requests] == [["b0001"], ["b0002"], ["b0004"], ["b0005"], ["b0006"]]
     assert all(r.user_message.startswith("Paper: Test paper\nSection: Section ") for r in requests)
 
-    client = FakeClient()
+    client = FakeClient()  # echoes filter_speech, which for the long equation b0005 is only "Equation 4."
     stats = cleanup_paper(paper, client=client)
-    assert len(client.calls) == 5
+    assert len(client.calls) == 6  # five chunks, then b0005 asked again
     assert [b["id"] for b in _blocks_in(client.calls[0])] == ["b0001"]  # the cache-warming request ran first
-    assert sorted(b["id"] for c in client.calls for b in _blocks_in(c)) == ["b0001", "b0002", "b0004", "b0005", "b0006"]
-    assert stats.blocks_llm == 5
+    assert sorted(b["id"] for c in client.calls[:5] for b in _blocks_in(c)) == ["b0001", "b0002", "b0004", "b0005", "b0006"]
+    repair = _blocks_in(client.calls[5])
+    assert [b["id"] for b in repair] == ["b0005"] and "not read in full" in repair[0]["problem"]
+    # a bare "Equation 4." was rejected; the repair request carries the full rule reading, which passes
+    assert repair[0]["filter_speech"].startswith("Equation 4: L equals the sum from t equals 1 to T")
+    assert (stats.blocks_llm, stats.blocks_rejected) == (5, 0)
 
 
 def test_missing_and_extra_ids():
@@ -214,10 +221,11 @@ def test_unusable_answers_keep_the_filter_text(client, warning):
 
 def test_equation_label_is_kept():
     paper = _paper()
-    answer = {**GOOD_ANSWERS, "b0005": "The loss is the squared error plus beta times the KL divergence."}
+    reading = "L equals the sum from t equals 1 to T of the squared norm of x hat t minus x t, plus beta times the KL divergence between q and p."
+    answer = {**GOOD_ANSWERS, "b0005": reading}
     cleanup_paper(paper, client=FakeClient(lambda blocks: [{"id": b["id"], "speech": answer[b["id"]]} for b in blocks]))
     b0005 = next(b for b in paper.iter_blocks() if b.id == "b0005")
-    assert b0005.speech == "Equation 4: The loss is the squared error plus beta times the KL divergence."
+    assert b0005.speech == f"Equation 4: {reading}"
 
 
 def test_skips_cleanly_without_credentials(monkeypatch, tmp_path):
@@ -275,9 +283,58 @@ def test_guard(source, speech, accepted):
 def test_guard_for_equations():
     block = Block(id="b1", type="equation", latex=r"\mathcal{L} = a + b", eq_number="4")
     block.speech = equation_speech(block)
-    assert guard_accepts(block, "Equation 4: the total loss is the reconstruction loss plus beta times the KL term.")
+    description = "Equation 4: the total loss is the reconstruction loss plus beta times the KL term."
+    assert guard_accepts(block, "Equation 4: L equals a plus b.")
+    assert not guard_accepts(block, description)  # read by symbols: every symbol must be said
+    assert guard_accepts(block, description, mode="meaning")
     assert not guard_accepts(block, "Equation 4: " + "and so on " * 40)
     assert not guard_accepts(block, r"Equation 4: \mathcal{L} = a + b")
+
+
+SAPG_PPO = (r"\begin{split}L_{\mathrm{on}}(\pi_{\theta})&=\mathop{\mathbb{E}}_{\pi_{\mathrm{old}}}\left[\min(r_{t}"
+            r"(\pi_{\theta}),\right.\\ &\left.\mathop{\mathrm{clip}}\left(r_{t}(\pi_{\theta}),1-\epsilon,1+\epsilon\right))"
+            r"A_{t}^{\pi_{old}}\right]\end{split}")
+
+
+def test_symbols_mode_rejects_a_description_of_a_long_equation():
+    """SAPG Eq. 2 (cleaned by symbols): a summary of what it computes is not a reading of it."""
+    block = Block(id="b2", type="equation", latex=SAPG_PPO, eq_number="2")
+    block.speech = equation_speech(block)
+    assert block.speech == "Equation 2."  # too long for the rules alone
+    summary = ("Equation 2: the PPO objective is the expectation under the old policy of the minimum of the "
+               "policy ratio and its clipped value, multiplied by the old policy advantage.")
+    reading = ("Equation 2: L on of pi theta equals the expectation over pi old of the minimum of r t of pi theta "
+               "and clip of r t of pi theta between 1 minus epsilon and 1 plus epsilon, times A t to the pi old.")
+    assert "not read in full" in cleanup.guard_reason(block, summary)
+    assert guard_accepts(block, reading)
+    assert cleanup.symbol_coverage(textfilter.equation_reading(block), reading) >= 0.9
+
+
+def test_rejected_equation_falls_back_to_the_full_reading():
+    paper = Paper(paper_id="p", arxiv_id="p", title="", source_url="x", sections=[Section(id="S1", title="", blocks=[
+        Block(id="b2", type="equation", latex=SAPG_PPO, eq_number="2")])])
+    textfilter.apply_filter(paper)
+    request = cleanup.plan_requests(paper)[0]
+    run = cleanup._new_run(paper, None, "test", [request], None, mode="symbols", inline="symbols")
+    run._apply(request, [cleanup._BlockSpeech(id="b2", speech="Equation 2: the PPO objective.")], "S1")
+    block = paper.sections[0].blocks[0]
+    assert block.speech_source == "llm_rejected"
+    assert block.speech.startswith("Equation 2: L on of pi theta equals") and "pi old" in block.speech
+
+
+@pytest.mark.parametrize(("latex", "spoken"), [
+    (r"V_{off,\pi_{i}}^{target}(s)", "V target off pi i of s"),
+    (r"A_{t}^{\pi_{old}}", "A t to the pi old"),
+    (r"\lambda_{ent}", "lambda ent"),
+    (r"L_{on}^{critic}", "L critic on"),
+    (r"x_{ij} + w_{kl}", "x i j plus w k l"),  # indices stay letters
+    (r"e^{iwt}", "e to the i w t"),  # a product in an exponent, not a label
+    (r"r^{c}_{t}", "r t to the c"),
+    (r"\pi(\cdot|s)", "pi of dot given s"),  # a placeholder, not a product
+    (r"a \cdot b", "a times b"),
+])
+def test_multi_letter_script_labels_are_words(latex, spoken):
+    assert textfilter.latex_to_speech(latex) == spoken
 
 
 def _vocabulary(*texts: str) -> set[str]:
@@ -328,7 +385,7 @@ def test_meaning_prompts_cover_each_part_separately():
 
 def test_system_prompt_is_stable_and_covers_the_rules():
     assert cleanup._build_system_prompt("symbols") == SYSTEM_PROMPT
-    assert 12 <= SYSTEM_PROMPT.count("\nInput: ") <= 16
+    assert 12 <= SYSTEM_PROMPT.count("\nInput: ") <= 17
     assert len(SYSTEM_PROMPT) / 4 > 512  # above Haiku 5.5's minimum cacheable prefix, even at 4 chars/token
     sources = " ".join(e.source for e in cleanup._EXAMPLES)
     for needle in ("[CITE].", "et al. [CITE]", "[CITE] proposed", "Fig. 3(b)", "Tab. II", "Eq. (5)", "Sec. 4.2",
@@ -359,3 +416,21 @@ def test_offline_export_and_import_use_the_same_requests_and_guard():
 
     with pytest.raises(ValueError):
         cleanup.import_answers(paper, [{"id": "b0001"}], model="x")
+
+
+def test_a_defining_sentence_must_keep_its_symbol():
+    """SAPG: replacing the symbol in the sentence that defines it says the name twice."""
+    source = (r"where $\hat{A}^{\pi_{\theta}}(s,a)$ is an advantage function that estimates the contribution of "
+              r"the transition to the gradient.")
+    block = _paragraph(source)
+    restated = ("where the estimated advantage function of the policy, state, and action is an advantage function "
+                "that estimates the contribution of the transition to the gradient.")
+    kept = ("where A hat to the policy of s and a is an advantage function that estimates the contribution of the "
+            "transition to the gradient.")
+    reason = cleanup.guard_reason(block, restated, mode="meaning")
+    assert reason and '"advantage function" twice' in reason
+    assert cleanup.guard_reason(block, kept, mode="meaning") is None
+    assert cleanup.guard_reason(block, restated, mode="symbols", inline="symbols") != reason  # meaning mode only
+    plural = _paragraph(r"where $\hat{Q}(s,a)$, $\hat{V}(s)$ are estimated $Q$ and value functions.")
+    assert cleanup.guard_reason(plural, "where the estimated Q function and the estimated value function are "
+                                        "estimated Q and value functions.", mode="meaning")

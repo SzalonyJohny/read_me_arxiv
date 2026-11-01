@@ -159,7 +159,8 @@ def test_block_counts(paper, paper_appendix):
 def test_paragraph_citations(paper):
     block = block_with(paper, "Mainstream CRL applications")
     assert "Mainstream CRL applications [CITE] predominantly rely" in block.text
-    assert '<span class="cite">[1, 2, 3, 4, 5]</span>' in block.html
+    # each citation keeps the bibliography entries it points to (the reader shows their titles)
+    assert '<span class="cite" data-refs="bib.bib2 bib.bib7 bib.bib8 bib.bib12 bib.bib16">[1, 2, 3, 4, 5]</span>' in block.html
     prose = [re.sub(r"\$[^$]*\$", "", b.text) for b in paper.iter_blocks()]  # maths may hold "[0,1]"
     assert not any(re.search(r"\[\d", t) for t in prose)
 
@@ -235,7 +236,7 @@ def test_fig_refs(paper, paper_appendix):
 
 _ALLOWED_TAGS = {"p", "span", "a", "em", "strong", "b", "i", "u", "sub", "sup", "code", "br", "small",
                  "table", "thead", "tbody", "tr", "td", "th", "ul", "ol", "li", "div"}
-_ALLOWED_ATTRS = {"class", "data-latex", "data-ref", "href", "colspan", "rowspan"}
+_ALLOWED_ATTRS = {"class", "data-latex", "data-ref", "data-refs", "href", "colspan", "rowspan"}
 
 
 class _Whitelist(HTMLParser):
@@ -311,8 +312,8 @@ def test_synthetic_document():
     assert [b.type for b in blocks] == ["figure", "paragraph", "equation"]
     para = blocks[1]
     assert para.text == "As Smith et al. [CITE] show [CITE], see this bold <tag> and Fig. 0."
-    assert 'Smith et al. <span class="cite">(2020a)</span>' in para.html
-    assert '<span class="cite">(Doe, 2019)</span>' in para.html
+    assert 'Smith et al. <span class="cite" data-refs="bib.bib1">(2020a)</span>' in para.html
+    assert '<span class="cite" data-refs="bib.bib2">(Doe, 2019)</span>' in para.html
     assert "<b>bold</b> &lt;tag&gt;" in para.html
     assert para.fig_refs == ["F0"]
     for bad in ("evil", "onclick", "script", "alert", "hidden", "footnote", "badmacro", "onmouseover"):
@@ -388,3 +389,14 @@ def test_download_figures(mock_http, tmp_path):
     download_figures(paper, tmp_path)
     assert mock_http.requested == []
     assert paper.figures["F4"].images == ["figures/x1.svg"]
+
+
+def test_references_are_kept_for_citation_titles(paper):
+    """The bibliography is not read aloud, but the reader shows a citation's title from it."""
+    assert paper.references, "no bibliography entries parsed"
+    block = block_with(paper, "Mainstream CRL applications")
+    ids = re.search(r'data-refs="([^"]+)"', block.html)[1].split()
+    assert all(i in paper.references for i in ids)
+    first = paper.references[ids[0]]
+    assert first.label == "1" and first.title and first.title in first.text
+    assert not any("[" in r.label for r in paper.references.values())  # "[14]" is stored as "14"

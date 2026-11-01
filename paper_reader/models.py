@@ -90,6 +90,14 @@ class CleanupStats(BaseModel):
     symbols_repaired: int = 0  # blocks re-asked because they named a symbol differently
 
 
+class Reference(BaseModel):
+    """One bibliography entry, for showing a citation's title in the reader."""
+
+    label: str  # as printed in the bibliography: "14", or "Agrawal et al. [2013]"
+    text: str  # the whole entry
+    title: str  # best guess at the title (the entry's second part, after the authors)
+
+
 class Paper(BaseModel):
     paper_id: str  # filesystem-safe id, e.g. "2601.17428v1"
     arxiv_id: str  # "2601.17428"
@@ -104,6 +112,7 @@ class Paper(BaseModel):
     figures: dict[str, Figure] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     cleanup: CleanupStats | None = None
+    references: dict[str, Reference] = Field(default_factory=dict)  # bibliography entry id -> entry
 
     def iter_blocks(self):
         for s in self.sections:

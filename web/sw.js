@@ -1,5 +1,6 @@
 // Service worker: offline reading.
-//  - App shell (pages, scripts, styles, fonts, icons): cached at install, then stale-while-revalidate.
+//  - App shell (pages, scripts, styles, fonts, icons): cached at install, then network-first, so a
+//    page never mixes files of two versions while the server is reachable; offline, the cached copies.
 //  - Saved papers: web/offline.js stores a paper's JSON, figures and one narration, plus its reader page
 //    and narration list, in the cache "paper-<id>". Those files are served cache-first, and the audio
 //    honours Range requests so the <audio> element can seek.
@@ -8,7 +9,7 @@
 //    no job polling).
 // Every response made without the server carries OFFLINE_HEADER, so pages can switch to offline mode.
 
-const SHELL_CACHE = "shell-v6"; // bump to re-cache the shell (old versions are deleted on activate)
+const SHELL_CACHE = "shell-v10"; // bump to re-cache the shell (old versions are deleted on activate)
 const SHELL_PREFIX = "shell-";
 const PAPER_PREFIX = "paper-"; // the cache names and index below are shared with web/offline.js
 const INDEX_CACHE = "offline-index";
@@ -25,7 +26,7 @@ const PAGE_ROUTES = [
   [/^\/(?:voices)?$/, shellPage],
 ];
 const ROUTES = [
-  [/^\/static\/|^\/manifest\.webmanifest$/, staleWhileRevalidate],
+  [/^\/static\/|^\/manifest\.webmanifest$/, shellFile],
   [/^\/papers\/([^/]+)\//, paperFile],
   [/^\/api\/papers\/([^/]+)\/audio$/, narrationList],
   [/^\/api\/papers$/, library],
@@ -70,13 +71,14 @@ async function deleteOldShells() {
   await Promise.all(old.map((name) => caches.delete(name)));
 }
 
-/** The shell's copy right away (else the network's); the network's copy replaces it for next time. */
-function staleWhileRevalidate(event) {
-  const network = fetch(event.request);
-  event.waitUntil(network.then((response) => store(SHELL_CACHE, event.request, response.clone())).catch(() => {}));
-  return caches.match(event.request, { cacheName: SHELL_CACHE })
-    .then((cached) => cached ?? network)
-    .catch(offlineResponse);
+/**
+ * Scripts, styles, fonts: the server's copy (which also refreshes the cache), else the cached one.
+ * Serving the cache first mixed versions after an update: a new reader.js with an old common.js
+ * fails to import, and the page never starts.
+ */
+function shellFile(event) {
+  return networkFirst(event, () => caches.match(event.request, { cacheName: SHELL_CACHE }),
+    (response) => store(SHELL_CACHE, event.request, response));
 }
 
 /** "/" and "/voices": network-first, falling back to the shell's copy (kept fresh while online). */
@@ -91,15 +93,15 @@ function paperCache(paperId) {
   return PAPER_PREFIX + paperId;
 }
 
-/** /reader/<id>: network-first; offline, the page saved with the paper, else the shell's reader.html. */
+/**
+ * /reader/<id>: network-first; offline, the shell's reader.html. Every paper has the same page, and
+ * the shell's copy matches the shell's scripts: the copy saved with a paper may be older than them
+ * (an old page with a new reader.js broke on its missing elements), so it is only the last resort.
+ */
 function readerPage(event, path, paperId) {
-  const cacheName = paperCache(paperId);
-  const saved = async () => (await caches.match(path, { cacheName }))
-    ?? caches.match("/static/reader.html", { cacheName: SHELL_CACHE });
-  const refreshSaved = async (response) => {
-    if (await caches.has(cacheName)) await store(cacheName, path, response);
-  };
-  return networkFirst(event, saved, refreshSaved);
+  const offline = async () => (await caches.match("/static/reader.html", { cacheName: SHELL_CACHE }))
+    ?? caches.match(path, { cacheName: paperCache(paperId) });
+  return networkFirst(event, offline);
 }
 
 /**

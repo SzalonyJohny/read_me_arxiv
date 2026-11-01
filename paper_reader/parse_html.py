@@ -32,7 +32,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from .models import Block, Figure, Paper, Section, SectionKind
+from .models import Block, Figure, Paper, Reference, Section, SectionKind
 
 _SECTION_LEVELS = {
     "ltx_part": 1,
@@ -322,17 +322,20 @@ class _Inline:
         visible = norm_text(cite.get_text())
         if not visible:
             return
+        # The bibliography entries it points to, so the reader can show their titles.
+        ids = [a["href"][1:] for a in cite.find_all("a", href=True) if a["href"].startswith("#bib.")]
+        refs = f' data-refs="{escape(" ".join(dict.fromkeys(ids)))}"' if ids else ""
         cls = _classes(cite)
         textual = bool(cls & _TEXTUAL_CITE_MACROS) or (
             not cls & _PARENTHETICAL_CITE_MACROS and visible[0] not in "([" and bool(_citation_names(visible))
         )
         names = _citation_names(visible) if textual else ""
         if not names:
-            self._emit(f'<span class="cite">{escape(visible, quote=False)}</span>', "[CITE]")
+            self._emit(f'<span class="cite"{refs}>{escape(visible, quote=False)}</span>', "[CITE]")
             return
         # "Smith et al. (2020)": the names stay visible, only "(2020)" / "[7]" is a hideable cite.
         marks = _CITE_MARKS if _CITE_MARKS.search(visible) else _YEAR
-        html = marks.sub(lambda m: f'<span class="cite">{m.group()}</span>', escape(visible, quote=False))
+        html = marks.sub(lambda m: f'<span class="cite"{refs}>{m.group()}</span>', escape(visible, quote=False))
         self._emit(html, f"{names} [CITE]")
 
     def _link(self, a: Tag) -> None:
@@ -646,6 +649,26 @@ def author_names(line: str) -> list[str]:
     return names
 
 
+def _references(soup: BeautifulSoup) -> dict[str, Reference]:
+    """The bibliography: entry id ("bib.bib14") -> label, full text and title. LaTeXML splits an
+    entry into blocks (authors, title, venue, URL), in numbered and author-year styles alike."""
+    references = {}
+    for item in soup.select(".ltx_bibliography li.ltx_bibitem[id]"):
+        for math in item.find_all("math"):  # its text holds the formula twice (MathML and annotation)
+            math.replace_with(math.get("alttext", ""))
+        tag = item.find(class_="ltx_tag")
+        label = norm_text(tag.get_text(" ")) if tag else ""
+        label = re.sub(r"\s+([.,])", r"\1", label)
+        label = label[1:-1] if re.fullmatch(r"\[[^\]]*\]", label) else label  # "[14]" -> "14"
+        parts = [norm_text(b.get_text(" ")) for b in item.find_all(class_="ltx_bibblock")]
+        parts = [re.sub(r"\s+([.,;:])", r"\1", p) for p in parts if p]
+        if not parts:
+            continue
+        title = parts[1] if len(parts) > 1 and not parts[1].startswith(("URL", "http", "arXiv:")) else parts[0]
+        references[item["id"]] = Reference(label=label, text=" ".join(parts), title=title.rstrip(" .,"))
+    return references
+
+
 def _authors(article: Tag) -> list[str]:
     """Best-effort clean author names (affiliations, emails and marks removed)."""
     names: list[str] = []
@@ -877,4 +900,5 @@ def parse_latexml(
         sections=sections,
         figures=conv.figures,
         warnings=warnings,
+        references=_references(soup),
     )

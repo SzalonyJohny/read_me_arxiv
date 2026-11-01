@@ -15,7 +15,13 @@ const AUTO_SCROLL_MS = 1200;
 const USER_SCROLL_MS = 1000; // scroll events this soon after user input (or each other) are the user's
 const SAVE_EVERY_MS = 3000;
 const SKIP_SECONDS = 15;
-const RATES = [0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const CITE_REACH = 18; // px: a tap this close to a citation is meant for it (and never moves the narration)
+const RATE_MIN = 0.5;
+const RATE_MAX = 2.5;
+const RATE_STEP = 0.1;
+const PROSE_UNITS = ".blk-paragraph, .blk-list_item, .blk-heading_note";
+// A full stop after these is not the end of a sentence ("e.g. the", "Fig. 3", "et al. [4]").
+const ABBREVIATION = /(?:^|[\s(])(?:e\.g|i\.e|et al|vs|cf|approx|resp|Figs?|Eqs?|Secs?|Tabs?|Refs?|No|Dr|Mr|Ms|St)\.$/i;
 const NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"]);
 const SCROLL_BEHAVIOR = matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
 const SPEECH_SOURCES = { filter: "rules", llm: "LLM", llm_rejected: "rules · LLM output rejected" };
@@ -38,18 +44,25 @@ const ui = {
   toc: $("toc"),
   tocList: $("toc-list"),
   shortTitle: $("short-title"),
+  fullTitle: $("full-title"),
   optCites: $("opt-cites"),
-  optSpeech: $("opt-speech"),
   optFollow: $("opt-follow"),
   player: $("player"),
   play: $("pl-play"),
   back: $("pl-back"),
   fwd: $("pl-fwd"),
   seek: $("pl-seek"),
+  marks: $("pl-marks"),
+  fullscreen: $("pl-fullscreen"),
   time: $("pl-time"),
-  rate: $("pl-rate"),
+  speed: $("speed"),
+  speedBtn: $("speed-btn"),
+  speedPanel: $("speed-panel"),
+  speedRange: $("speed-range"),
+  speedValue: $("speed-value"),
+  speedOut: $("speed-out"),
   run: $("pl-run"),
-  nowReading: $("now-reading"),
+  toast: $("offline-toast"),
   resume: $("resume"),
   audio: $("audio"),
   figPane: $("fig-pane"),
@@ -85,11 +98,20 @@ const state = {
   unitFirstSeg: new Map(), // unit id -> index of its first segment
   segIndex: -1,
   readingEl: null,
+  setupErrors: [], // parts of the page that failed to start (the paper still loads)
+  unitSegments: new Map(), // unit id -> number of narration segments (sentences) in it
+  sentences: new Map(), // unit id -> Ranges over its displayed sentences (computed on first use)
   pendingSeek: null,
   seekDragging: false,
   ticking: false,
   lastSaved: 0,
 };
+
+// The narrated sentence is tinted in the text with the CSS Custom Highlight API (no DOM changes).
+const narrated = globalThis.Highlight && CSS.highlights ? new Highlight() : null;
+if (narrated) CSS.highlights.set("narrated", narrated);
+
+const citePop = { el: null, cite: null }; // the open reference popover and the citation it belongs to
 
 const follow = { suspended: false, resumeTimer: 0, autoScrolling: false, autoTimer: 0, userScrollAt: -Infinity };
 
@@ -182,14 +204,22 @@ function renderPaper(paper) {
   document.title = `${plainText(paper.title)} · Paper Reader`;
   ui.shortTitle.textContent = mathDelimiters(shortTitle(paper.title));
   ui.shortTitle.title = paper.title;
+  if (ui.fullTitle) ui.fullTitle.textContent = mathDelimiters(paper.title); // phones: the whole title, one small line
   ui.paper.replaceChildren(renderFrontMatter(paper), ...paper.sections.map(renderSection));
   for (const link of ui.paper.querySelectorAll('a[href^="http"]')) {
     link.target = "_blank";
     link.rel = "noopener";
   }
   attachCitationSpaces(ui.paper);
+  if (Object.keys(paper.references ?? {}).length) {
+    for (const cite of ui.paper.querySelectorAll(".cite")) {
+      cite.tabIndex = 0;
+      cite.setAttribute("role", "button");
+      cite.title = "Show the reference";
+    }
+  }
   renderToc(paper.sections);
-  for (const root of [ui.paper, ui.tocList, ui.shortTitle]) renderMath(root);
+  for (const root of [ui.paper, ui.tocList, ui.shortTitle, ui.fullTitle]) if (root) renderMath(root);
 }
 
 /** Titles as plain text, e.g. for the tab and the lock screen ($…$ maths keeps its LaTeX). */
@@ -237,10 +267,13 @@ function renderAbout(paper) {
     ...cleanupRows(paper.cleanup),
   ];
   const warnings = paper.warnings ?? [];
+  const showSpeech = h("input", { type: "checkbox" });
+  bindToggle(showSpeech, "speech", (on) => document.body.classList.toggle("show-speech", on));
   return h("details", { class: "about" },
     h("summary", {}, "About this text",
       warnings.length > 0 && h("span", { class: "badge warn", text: `${warnings.length} warning${warnings.length > 1 ? "s" : ""}` })),
     h("dl", {}, rows.flatMap(([term, value]) => [h("dt", { text: term }), h("dd", { text: value })])),
+    h("label", { class: "check about-speech" }, showSpeech, " Show the spoken text under each paragraph"),
     warnings.length > 0 && h("ul", { class: "warnings" }, warnings.map((w) => h("li", { text: w }))),
     renderSymbolNames(paper.cleanup),
     renderRecleanup(paper));
@@ -632,7 +665,12 @@ function followSegment(i, unitChanged) {
   if (!el) return;
   const tall = el.offsetHeight > TALL_UNIT * ui.pane.clientHeight;
   if (!unitChanged && !tall) return;
-  const within = tall ? state.segFraction[i] * el.offsetHeight : 0;
+  let within = 0;
+  if (tall) {
+    const sentence = sentenceFor(i);
+    within = sentence ? sentence.getBoundingClientRect().top - el.getBoundingClientRect().top
+      : state.segFraction[i] * el.offsetHeight;
+  }
   autoScrollTo(offsetInPane(el) + within - FOLLOW_LINE * ui.pane.clientHeight);
 }
 
@@ -667,6 +705,8 @@ function activateRun(run) {
   state.segFigure = lastFigurePerSegment(run.segments, state.paper.figures);
   state.segFraction = fractionWithinUnit(run.segments);
   state.unitFirstSeg = firstSegmentPerUnit(run.segments);
+  state.unitSegments = new Map();
+  for (const s of run.segments) state.unitSegments.set(s.unit_id, (state.unitSegments.get(s.unit_id) ?? 0) + 1);
   state.segIndex = -1;
   markSeekable();
   state.pendingSeek = Number.isFinite(startAt) ? startAt : store.get(positionKey(run), 0);
@@ -674,13 +714,34 @@ function activateRun(run) {
   ui.audio.src = paperFile(run.audio_file);
   ui.run.value = run.run_id;
   ui.seek.max = String(run.duration || 0);
+  renderSectionMarks(run);
   ui.player.hidden = false;
-  ui.nowReading.hidden = false;
-  ui.nowReading.textContent = "";
+  if (ui.speed) ui.speed.hidden = false;
   document.body.classList.add("has-audio");
   store.set(`run:${paperId}`, run.run_id);
   updateTimeUI();
   updateNowPlaying();
+}
+
+/** Ticks on the seek bar where each section's narration starts (taller for main sections). */
+function renderSectionMarks(run) {
+  if (!ui.marks) return;
+  const duration = mediaDuration() || run.segments.at(-1)?.end || 0;
+  const seen = new Set();
+  const marks = [];
+  for (const seg of run.segments) {
+    const section = state.sectionOf.get(seg.unit_id);
+    if (!section || seen.has(section.id) || !duration) continue;
+    seen.add(section.id);
+    if (seg.start < 1) continue; // the first section starts at the start of the bar
+    const name = plainText([section.number, section.title].filter(Boolean).join(" "));
+    marks.push(h("span", {
+      class: `seek-mark${section.level <= 1 ? " main" : ""}`,
+      style: `--at: ${(seg.start / duration).toFixed(4)}`,
+      title: `${fmt.time(seg.start)} ${name}`,
+    }));
+  }
+  ui.marks.replaceChildren(...marks);
 }
 
 function fractionWithinUnit(segments) {
@@ -740,9 +801,9 @@ function setSegment(i, seeked) {
   const previous = segments[state.segIndex];
   const seg = segments[i];
   state.segIndex = i;
-  ui.nowReading.textContent = seg?.text ?? "";
   const unitChanged = seg?.unit_id !== previous?.unit_id;
   if (unitChanged) markReading(seg ? $(seg.unit_id) : null);
+  markSentence(seg ? sentenceFor(i) : null);
   if (seg && shouldFollow()) followSegment(i, unitChanged || seeked);
   if (seeked || isNarrating()) showFigure(state.segFigure[i] ?? null, "narration");
   updateNowPlaying();
@@ -765,6 +826,75 @@ function markReading(el) {
   state.readingEl?.classList.remove("reading");
   el?.classList.add("reading");
   state.readingEl = el;
+  if (!el) markSentence(null);
+}
+
+function markSentence(range) {
+  if (!narrated) return;
+  narrated.clear();
+  if (range) narrated.add(range);
+}
+
+/**
+ * The displayed sentence that narration segment i reads. A paragraph's narration has one segment
+ * per sentence, so the k-th segment is the k-th sentence on screen; when the counts differ (a
+ * sentence split for the voice), the sentence at the same position in the text is used.
+ */
+function sentenceFor(i) {
+  const seg = state.run?.segments[i];
+  const el = seg && $(seg.unit_id);
+  if (!el || !narrated || !el.matches(PROSE_UNITS)) return null;
+  const cached = state.sentences.get(seg.unit_id);
+  if (!cached || !cached.ranges[0]?.startContainer.isConnected) state.sentences.set(seg.unit_id, sentenceRanges(el));
+  const { ranges, starts, length } = state.sentences.get(seg.unit_id);
+  if (ranges.length === 0) return null;
+  const count = state.unitSegments.get(seg.unit_id) ?? 1;
+  const k = i - (state.unitFirstSeg.get(seg.unit_id) ?? i);
+  if (ranges.length === count) return ranges[k] ?? null;
+  const next = i + 1 < state.run.segments.length && state.run.segments[i + 1].unit_id === seg.unit_id
+    ? state.segFraction[i + 1] : 1;
+  const middle = ((state.segFraction[i] + next) / 2) * length;
+  return ranges[Math.max(0, lastIndexWhere(starts, (start) => start <= middle))];
+}
+
+/** Ranges over the sentences of a prose block's visible text; maths and the spoken-text box are skipped. */
+function sentenceRanges(el) {
+  const pieces = [];
+  let text = "";
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => (node.parentElement.closest(".speech, .katex-mathml")
+      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+  });
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    pieces.push({ node, start: text.length, math: Boolean(node.parentElement.closest(".katex")) });
+    text += node.data;
+  }
+  const pieceAt = (offset) => pieces[Math.max(0, lastIndexWhere(pieces, (p) => p.start <= offset))];
+  const ends = [];
+  for (const m of text.matchAll(/[.?!]["'”’)\]]*(?=\s+\S)/g)) {
+    const end = m.index + m[0].length;
+    const following = text.slice(end).trimStart()[0];
+    if (pieceAt(m.index).math || /[a-z]/.test(following) || ABBREVIATION.test(text.slice(Math.max(0, m.index - 8), m.index + 1))) continue;
+    ends.push(end);
+  }
+  ends.push(text.length);
+  const ranges = [];
+  const starts = [];
+  let start = 0;
+  for (const end of ends) {
+    const from = start + (text.slice(start, end).length - text.slice(start, end).trimStart().length);
+    if (end > from) {
+      const range = document.createRange();
+      const a = pieceAt(from);
+      const b = pieceAt(end - 1);
+      range.setStart(a.node, from - a.start);
+      range.setEnd(b.node, end - b.start);
+      ranges.push(range);
+      starts.push(from);
+    }
+    start = end;
+  }
+  return { ranges, starts, length: text.length || 1 };
 }
 
 function tick() {
@@ -789,6 +919,7 @@ function onPlay() {
 function onMetadata() {
   const duration = mediaDuration();
   ui.seek.max = String(duration);
+  if (state.run) renderSectionMarks(state.run);
   const target = state.pendingSeek;
   state.pendingSeek = null;
   if (target > 0 && target < duration - 1) ui.audio.currentTime = target;
@@ -807,10 +938,42 @@ function seekTo(t) {
   ui.audio.currentTime = Math.min(Math.max(t, 0), mediaDuration());
 }
 
-function setRate(rate) {
+/** Playback speed in steps of 0.1 between RATE_MIN and RATE_MAX; remembered across papers. */
+function setRate(value) {
+  const rate = Math.round(Math.min(Math.max(Number(value) || 1, RATE_MIN), RATE_MAX) / RATE_STEP) * RATE_STEP;
+  const label = `${rate.toFixed(1)}×`;
   ui.audio.defaultPlaybackRate = rate;
   ui.audio.playbackRate = rate;
-  store.set("rate", rate);
+  ui.speedRange.value = String(rate);
+  ui.speedValue.textContent = label;
+  ui.speedOut.textContent = label;
+  ui.speedBtn.setAttribute("aria-label", `Playback speed ${label}`);
+  store.set("rate", Number(rate.toFixed(1)));
+}
+
+function openSpeed(open) {
+  ui.speedPanel.hidden = !open;
+  ui.speedBtn.setAttribute("aria-expanded", String(open));
+  if (open) ui.speedRange.focus({ preventScroll: true });
+}
+
+function initSpeed() {
+  setRate(store.get("rate", 1));
+  ui.speedBtn.addEventListener("click", () => openSpeed(ui.speedPanel.hidden));
+  ui.speedRange.addEventListener("input", () => setRate(ui.speedRange.value));
+  $("speed-down").addEventListener("click", () => setRate(ui.audio.playbackRate - RATE_STEP));
+  $("speed-up").addEventListener("click", () => setRate(ui.audio.playbackRate + RATE_STEP));
+  $("speed-reset").addEventListener("click", () => setRate(1));
+  document.addEventListener("click", (e) => {
+    if (!ui.speedPanel.hidden && !ui.speed.contains(e.target)) openSpeed(false);
+  });
+  ui.speed.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !ui.speedPanel.hidden) {
+      e.stopPropagation();
+      openSpeed(false);
+      ui.speedBtn.focus();
+    }
+  });
 }
 
 function renderPlayState() {
@@ -827,21 +990,26 @@ function updateTimeUI() {
 }
 
 function showAudioError(message) {
-  ui.nowReading.hidden = false;
-  ui.nowReading.textContent = `Audio problem: ${message}`;
+  ui.toast.textContent = `Audio problem: ${message}`;
+  ui.toast.classList.add("is-error");
+  setTimeout(() => {
+    ui.toast.textContent = "";
+    ui.toast.classList.remove("is-error");
+  }, 8000);
 }
 
 function initPlayer() {
-  const savedRate = store.get("rate", 1);
-  const rate = RATES.includes(savedRate) ? savedRate : 1;
-  ui.rate.replaceChildren(...RATES.map((r) => h("option", { value: String(r), text: `${r}×` })));
-  ui.rate.value = String(rate);
-  setRate(rate);
+  initSpeed();
 
   ui.play.addEventListener("click", togglePlay);
+  // Phones hide the seek bar; tapping the time shows it as a line above the controls (and hides it again).
+  ui.time.addEventListener("click", () => {
+    const open = !document.body.classList.contains("seek-open");
+    document.body.classList.toggle("seek-open", open);
+    ui.time.setAttribute("aria-expanded", String(open));
+  });
   ui.back.addEventListener("click", () => seekTo(ui.audio.currentTime - SKIP_SECONDS));
   ui.fwd.addEventListener("click", () => seekTo(ui.audio.currentTime + SKIP_SECONDS));
-  ui.rate.addEventListener("change", () => setRate(Number(ui.rate.value)));
   ui.run.addEventListener("change", () => {
     activateRun(state.runs.find((r) => r.run_id === ui.run.value));
     narrationChanged();
@@ -873,6 +1041,16 @@ function initPlayer() {
 // ---------------------------------------------------------------- user input
 
 function onPaneClick(event) {
+  if (citePop.el?.contains(event.target)) return; // links inside the popover open on their own
+  const cite = event.target.closest(".cite") ?? citeNear(event);
+  if (cite) {
+    onCiteClick(cite);
+    return;
+  }
+  if (citePop.el) {
+    closeCitation(); // this tap only closes the popover
+    return;
+  }
   const ref = event.target.closest("a.ref");
   if (ref) {
     onRefClick(event, ref);
@@ -894,6 +1072,111 @@ function onPaneClick(event) {
   if (i === undefined) return;
   resumeFollow(false);
   seekTo(state.run.segments[i].start);
+}
+
+// ---------------------------------------------------------------- citations
+
+/** The bibliography entries a citation points to (data-refs, else its numbers: "[3, 7]", "[3–5]"). */
+function citationRefs(cite) {
+  const refs = state.paper.references ?? {};
+  const ids = (cite.dataset.refs ?? "").split(" ").filter((id) => id in refs);
+  if (ids.length) return ids.map((id) => refs[id]);
+  const byLabel = new Map(Object.values(refs).map((r) => [r.label, r]));
+  const labels = [];
+  for (const part of cite.textContent.replace(/[[\]()]/g, "").split(/[,;]/)) {
+    const range = part.trim().match(/^(\d+)\s*[–-]\s*(\d+)$/);
+    if (range) for (let n = Number(range[1]); n <= Number(range[2]) && labels.length < 30; n++) labels.push(String(n));
+    else if (part.trim()) labels.push(part.trim());
+  }
+  return labels.map((label) => byLabel.get(label)).filter(Boolean);
+}
+
+function searchUrl(ref) {
+  return `https://www.google.com/search?q=${encodeURIComponent(ref.title)}`;
+}
+
+/** First tap: the reference's title. Second tap on a single reference: search for it in a new tab. */
+function onCiteClick(cite) {
+  const refs = citationRefs(cite);
+  if (citePop.cite === cite) {
+    closeCitation();
+    if (refs.length === 1) window.open(searchUrl(refs[0]), "_blank", "noopener");
+    return;
+  }
+  showCitation(cite, refs);
+}
+
+function showCitation(cite, refs) {
+  closeCitation();
+  const pop = h("div", { class: "cite-pop", role: "dialog", "aria-label": "Reference" },
+    refs.length
+      ? refs.map((ref) => h("a", { class: "cite-ref", href: searchUrl(ref), target: "_blank", rel: "noopener" },
+        h("span", { class: "cite-label", text: ref.label }),
+        h("span", { class: "cite-title", text: ref.title }),
+        h("span", { class: "cite-entry", text: ref.text })))
+      : h("p", { class: "cite-none", text: "This reference is not in the paper's data." }),
+    refs.length > 0 && h("p", { class: "cite-hint",
+      text: refs.length === 1 ? "Tap the citation again to search for it." : "Tap a title to search for it." }));
+  ui.pane.append(pop);
+  const paneBox = ui.pane.getBoundingClientRect();
+  const box = cite.getBoundingClientRect();
+  const left = Math.min(Math.max(8, box.left - paneBox.left - 12), ui.pane.clientWidth - pop.offsetWidth - 8);
+  pop.style.left = `${Math.max(8, left)}px`;
+  pop.style.top = `${box.bottom - paneBox.top + ui.pane.scrollTop + 6}px`;
+  cite.classList.add("is-open");
+  citePop.el = pop;
+  citePop.cite = cite;
+}
+
+function closeCitation() {
+  citePop.el?.remove();
+  citePop.cite?.classList.remove("is-open");
+  citePop.el = citePop.cite = null;
+}
+
+/** A visible citation within CITE_REACH of the tap, in the tapped block. */
+function citeNear(event) {
+  const block = event.target.closest?.(".blk");
+  if (!block || !Number.isFinite(event.clientX)) return null;
+  let best = null;
+  let bestDistance = CITE_REACH;
+  for (const cite of block.querySelectorAll(".cite")) {
+    for (const r of cite.getClientRects()) {
+      const dx = Math.max(r.left - event.clientX, 0, event.clientX - r.right);
+      const dy = Math.max(r.top - event.clientY, 0, event.clientY - r.bottom);
+      const distance = Math.hypot(dx, dy);
+      if (distance <= bestDistance) {
+        best = cite;
+        bestDistance = distance;
+      }
+    }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------- full screen (phones)
+
+/**
+ * Phones in a browser tab: a button at the bottom right goes full screen, which hides Chrome's
+ * address bar (Chrome then shows its own notice). Never automatic. Opened from a home-screen icon,
+ * the app has no address bar, and no button.
+ */
+function initFullscreen() {
+  const root = document.documentElement;
+  const phone = matchMedia("(hover: none) and (pointer: coarse)").matches;
+  const inTab = matchMedia("(display-mode: browser)").matches;
+  if (!ui.fullscreen || !phone || !inTab || !document.fullscreenEnabled || !root.requestFullscreen) return;
+  ui.fullscreen.hidden = false;
+  ui.fullscreen.addEventListener("click", () => {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else root.requestFullscreen({ navigationUI: "hide" }).catch(() => {});
+  });
+  document.addEventListener("fullscreenchange", () => {
+    const on = Boolean(document.fullscreenElement);
+    ui.fullscreen.classList.toggle("is-full", on);
+    ui.fullscreen.setAttribute("aria-label", on ? "Leave full screen" : "Full screen");
+    ui.fullscreen.title = on ? "Leave full screen" : "Full screen";
+  });
 }
 
 function onRefClick(event, ref) {
@@ -929,7 +1212,12 @@ function onTocClick(event) {
 
 function onKeyDown(event) {
   if (isTextEntry(event.target) || event.target.closest("dialog")) return;
-  if (event.key === "Enter" && event.target.matches?.(".blk-equation.has-reading")) {
+  if (event.key === "Escape" && citePop.el) {
+    closeCitation();
+  } else if (event.key === "Enter" && event.target.matches?.(".cite[role=button]")) {
+    event.preventDefault();
+    onCiteClick(event.target);
+  } else if (event.key === "Enter" && event.target.matches?.(".blk-equation.has-reading")) {
     event.preventDefault();
     toggleReading(event.target);
   } else if (event.key === " " && state.run) {
@@ -957,7 +1245,6 @@ function bindToggle(input, key, onChange) {
 
 function initControls() {
   bindToggle(ui.optCites, "cites", (on) => document.body.classList.toggle("show-cites", on));
-  bindToggle(ui.optSpeech, "speech", (on) => document.body.classList.toggle("show-speech", on));
   bindToggle(ui.optFollow, "follow", (on) => resumeFollow(on && !ui.audio.paused));
   ui.resume.addEventListener("click", () => resumeFollow(true));
 
@@ -972,6 +1259,7 @@ function initControls() {
   ui.tocList.addEventListener("click", onTocClick);
   document.addEventListener("click", (e) => {
     if (ui.toc.open && !ui.toc.contains(e.target)) ui.toc.open = false;
+    if (citePop.el && !ui.pane.contains(e.target)) closeCitation();
   });
   document.addEventListener("keydown", onKeyDown);
   document.addEventListener("keyup", onKeyUp);
@@ -1001,36 +1289,77 @@ function loadError(err) {
 
 // ---------------------------------------------------------------- boot
 
+/** Runs one part of the page's setup; a part that fails is reported but never stops the paper loading. */
+function safely(part, fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.error(`Reader: ${part} failed`, err);
+    state.setupErrors.push(`${part}: ${err.message}`);
+  }
+}
+
+/**
+ * A reader page older than this script (a copy cached before an update) lacks newer elements: load
+ * the current page once instead of running half a reader.
+ */
+function reloadIfOutdated() {
+  if (["speed", "full-title"].every((id) => $(id))) return false;
+  try {
+    if (sessionStorage.getItem("reader-reloaded") === location.pathname) return false; // tried once already
+    sessionStorage.setItem("reader-reloaded", location.pathname);
+  } catch {
+    return false;
+  }
+  location.reload();
+  return true;
+}
+
 async function boot() {
-  registerServiceWorker();
-  initControls();
-  initPlayer();
-  initListen({
+  if (reloadIfOutdated()) return;
+  const paper = api(paperFile("paper.json")); // first, so nothing below can hold it up
+  paper.catch(() => {}); // handled below
+  safely("service worker", registerServiceWorker);
+  safely("full screen", initFullscreen);
+  safely("controls", initControls);
+  safely("player", initPlayer);
+  safely("listen panel", () => initListen({
     paperId,
     openButton: ui.listen,
     buttonLabel: $("listen-label"),
     onAudioReady: (runId) => loadRuns(runId),
-  });
-  initSaveOffline({
+  }));
+  safely("save offline", () => initSaveOffline({
     paperId,
     selectedRun: () => state.run,
     runLabel: (runId) => {
       const run = state.runs.find((r) => r.run_id === runId);
       return run ? runLabel(run) : runId;
     },
+  }));
+  safely("connection", () => {
+    renderConnection();
+    connection.addEventListener("change", renderConnection);
   });
-  renderConnection();
-  connection.addEventListener("change", renderConnection);
   try {
-    state.paper = await api(paperFile("paper.json"));
+    state.paper = await paper;
   } catch (err) {
     ui.shortTitle.textContent = "Paper unavailable";
     ui.paper.replaceChildren(loadError(err));
     return;
   }
-  renderPaper(state.paper);
-  indexPaper(state.paper);
-  refreshFigure();
+  try {
+    renderPaper(state.paper);
+    indexPaper(state.paper);
+    refreshFigure();
+  } catch (err) {
+    console.error("Reader: could not show the paper", err);
+    ui.paper.replaceChildren(h("div", { class: "load-offline" },
+      h("p", { class: "error", text: `Could not show this paper: ${err.message}` }),
+      h("p", {}, h("button", { class: "btn", type: "button", text: "Reload", onclick: () => location.reload() }))));
+    return;
+  }
+  if (state.setupErrors.length) console.warn("Reader started with problems:", state.setupErrors);
   await loadRuns();
 }
 

@@ -71,6 +71,10 @@ body.reader {
   transition: transform 0.15s ease;
 }
 
+.full-title {
+  display: none;
+}
+
 .toc[open] .caret {
   transform: rotate(180deg);
 }
@@ -354,18 +358,56 @@ body.reader {
   color: var(--text-2);
 }
 
-.seek {
+.seek-wrap {
+  position: relative;
   flex: 1 1 160px;
   min-width: 100px;
-  height: 18px;
   margin: 0 0.25rem;
+  --thumb: 16px; /* the range thumb: ticks line up with where it would stand */
+}
+
+.seek {
+  display: block;
+  width: 100%;
+  height: 18px;
+  margin: 0;
+}
+
+/* Section starts on the seek bar: thin ticks above the track; pointer events go to the slider. */
+.seek-marks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.seek-mark {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--at));
+  width: 2px;
+  height: 6px;
+  margin-left: -1px;
+  transform: translateY(-50%);
+  border-radius: 1px;
+  background: var(--text-2);
+  opacity: 0.45;
+}
+
+.seek-mark.main {
+  height: 12px;
+  opacity: 0.7;
 }
 
 .time {
   min-width: 7.5em;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--text-2);
+  font: inherit;
   font-variant-numeric: tabular-nums;
   text-align: right;
+  cursor: default;
 }
 
 .player select {
@@ -374,28 +416,6 @@ body.reader {
 
 #pl-run {
   max-width: 16rem;
-}
-
-.now-reading {
-  margin: 0;
-  padding: 0.25rem 1rem 0.35rem;
-  border-top: 1px solid var(--border);
-  background: var(--surface-2);
-  color: var(--muted);
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 0.875rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  min-height: 1.9em;
-}
-
-.now-reading:empty::before {
-  content: "Press play, or click a paragraph to listen from there.";
-  font-family: var(--sans);
-  font-style: normal;
-  font-size: 0.8125rem;
 }
 
 /* ---------------------------------------------------------------- panes */
@@ -782,6 +802,23 @@ body.has-audio .seekable:hover:not(.reading) {
 .reading {
   background: var(--reading);
   box-shadow: inset 3px 0 0 var(--reading-edge);
+}
+
+/* Where the browser can tint a text range, the narrated sentence carries the highlight and its
+   paragraph keeps only a thin edge mark. */
+body.reader {
+  --sentence: color-mix(in srgb, var(--reading-edge) 16%, transparent);
+}
+
+@supports selector(::highlight(narrated)) {
+  .reading:is(.blk-paragraph, .blk-list_item, .blk-heading_note) {
+    background: none;
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--reading-edge) 55%, transparent);
+  }
+}
+
+::highlight(narrated) {
+  background-color: var(--sentence);
 }
 
 .flash {
@@ -1301,7 +1338,7 @@ body.has-audio .seekable:hover:not(.reading) {
     padding: 0.3rem 0.35rem;
   }
 
-  .seek {
+  .seek-wrap {
     flex: 1 1 70px;
     min-width: 60px;
     margin: 0;
@@ -1315,10 +1352,6 @@ body.has-audio .seekable:hover:not(.reading) {
   #pl-run {
     flex: 1 1 100%;
     max-width: none;
-  }
-
-  .now-reading {
-    padding: 0.2rem 0.75rem 0.3rem;
   }
 
   .panes {
@@ -1466,3 +1499,385 @@ body.has-audio .seekable:hover:not(.reading) {
 }
 .blk-equation.show-reading .speech-src { display: none; }
 @media (max-width: 600px) { .blk-equation.show-reading .speech { margin-inline: 0.5em; } }
+
+/* Playback speed: a pill in the view-options row; its panel holds a 0.1-step slider. */
+.speed {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.speed-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.12rem 0.55rem 0.12rem 0.45rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.speed-btn:hover {
+  background: var(--hover);
+}
+
+.speed-btn[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.speed .speed-panel {
+  left: auto;
+  right: 0;
+  width: min(300px, calc(100vw - 1rem));
+  padding: 0.6rem 0.75rem 0.7rem;
+  color: var(--text);
+}
+
+.speed-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.8125rem;
+}
+
+.speed-out {
+  margin-left: auto;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.speed-reset {
+  padding: 0.15rem 0.45rem;
+  font-size: 0.8125rem;
+}
+
+.speed-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.speed-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.speed-row .btn {
+  min-width: 2.25rem;
+  padding: 0.3rem 0.5rem;
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+/* The spoken-text option inside "About this text" */
+.about .about-speech {
+  display: flex;
+  margin: 0.25rem 0.75rem 0.5rem;
+  font-size: 0.875rem;
+}
+
+@media (max-width: 900px) {
+  .speed {
+    position: static; /* the panel spans the bar, under the options row */
+  }
+
+  .speed .speed-panel {
+    left: 0.5rem;
+    right: 0.5rem;
+    top: calc(100% + 4px);
+    width: auto;
+  }
+
+  .speed-row .btn {
+    min-width: 2.75rem;
+    padding: 0.45rem 0.5rem;
+  }
+}
+
+/* ---------------------------------------------------------------- phone layout
+   Top: the paper title as one small line (tap it for the sections), then one line of settings.
+   Bottom: -15 · play · +15, with the time; no seek bar and no narration picker.
+   Citations are always shown, so their switch goes. */
+@media (max-width: 900px) {
+  body.reader {
+    --bottom-bar: 4.25rem;
+    box-sizing: border-box;
+  }
+
+  .bar-row {
+    gap: 0.25rem 0.5rem;
+    padding: 0.2rem 0.6rem 0.4rem;
+  }
+
+  .home {
+    order: 0;
+    padding: 0.2rem;
+  }
+
+  .toc {
+    order: 1;
+    flex: 1 1 calc(100% - 3rem); /* fills the first line; the settings wrap onto the second */
+  }
+
+  .toc summary {
+    max-width: 100%;
+    padding: 0.15rem 0.25rem;
+  }
+
+  .short-title:not(:empty) + .full-title:not(:empty) {
+    display: block;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-2);
+    font-size: 0.8125rem;
+    font-weight: 600;
+  }
+
+  .short-title:has(+ .full-title:not(:empty)) {
+    display: none;
+  }
+
+  .menu-panel {
+    top: calc(100% + 2px);
+  }
+
+  .toggles {
+    order: 2;
+    flex: 1 1 auto;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0;
+  }
+
+  .switch:has(#opt-cites) {
+    display: none;
+  }
+
+  .offline-badge {
+    order: 3;
+  }
+
+  .offline {
+    order: 4;
+  }
+
+  .listen-btn {
+    order: 5;
+  }
+
+  .offline-btn,
+  .listen-btn {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8125rem;
+  }
+
+  /* With a narration, Listen (to make another) is an icon. */
+  body.has-audio #listen-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .cite {
+    display: inline;
+    color: var(--muted);
+    font-size: 0.85em;
+  }
+
+  body.reader.has-audio {
+    padding-bottom: var(--bottom-bar);
+  }
+
+  .player {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    display: grid;
+    grid-template-columns: 1fr auto auto auto 1fr;
+    align-items: center;
+    gap: 0 1.25rem;
+    min-height: var(--bottom-bar);
+    padding: 0.35rem 1rem max(0.35rem, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.06);
+  }
+
+  .player .time {
+    grid-row: 2;
+    grid-column: 1;
+    justify-self: start;
+    min-width: 0;
+    padding: 0.6rem 0.4rem 0.6rem 0;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+
+  .player .time[aria-expanded="true"] {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .player #pl-back {
+    grid-row: 2;
+    grid-column: 2;
+  }
+
+  .player .play {
+    grid-row: 2;
+    grid-column: 3;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 3.1rem;
+    height: 3.1rem;
+    padding: 0;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--surface);
+    font-size: 1.25rem;
+  }
+
+  .player .play:hover:not(:disabled) {
+    background: var(--accent);
+    filter: brightness(1.08);
+  }
+
+  .player #pl-fwd {
+    grid-row: 2;
+    grid-column: 4;
+  }
+
+  .player .skip {
+    padding: 0.5rem 0.6rem;
+    font-size: 0.95rem;
+  }
+
+  .player .seek-wrap,
+  .player #pl-run {
+    display: none;
+  }
+
+  /* Tapping the time opens the seek bar as a line of its own, above the controls. */
+  body.reader.seek-open {
+    --bottom-bar: 6.5rem;
+  }
+
+  body.seek-open .player .seek-wrap {
+    display: block;
+    grid-row: 1;
+    grid-column: 1 / -1;
+    width: 100%;
+    margin: 0.15rem 0 0.1rem;
+  }
+
+  body.seek-open .player .seek {
+    height: 28px;
+    accent-color: var(--accent);
+  }
+
+  body.has-audio .toast {
+    bottom: calc(var(--bottom-bar) + 0.75rem);
+  }
+}
+
+/* Citations: tap for the reference's title, tap again to search for it. */
+body.show-cites .cite[role="button"] {
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.cite[role="button"]:hover,
+.cite.is-open {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.cite-pop {
+  position: absolute;
+  z-index: 4;
+  width: min(26rem, calc(100% - 16px));
+  padding: 0.35rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  font-family: var(--sans);
+  font-size: 0.875rem;
+  line-height: 1.4;
+}
+
+.cite-ref {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.1rem 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.cite-ref:hover {
+  background: var(--hover);
+}
+
+.cite-label {
+  grid-row: 1 / 3;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.cite-title {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.cite-entry {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.cite-hint,
+.cite-none {
+  margin: 0.15rem 0.5rem 0.3rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+/* Full screen (phones in a browser tab): bottom right of the player bar. */
+.fs-btn .i-collapse,
+.fs-btn.is-full .i-expand {
+  display: none;
+}
+
+.fs-btn.is-full .i-collapse {
+  display: block;
+}
+
+@media (max-width: 900px) {
+  .player .fs-btn {
+    grid-row: 2;
+    grid-column: 5;
+    justify-self: end;
+    padding: 0.5rem;
+    font-size: 1.1rem;
+  }
+}

@@ -102,6 +102,42 @@ def list_audio_runs(paper_id: str) -> list[AudioManifest]:
     return [AudioManifest.model_validate_json(p.read_text(encoding="utf-8")) for p in manifests]
 
 
+def add_references(paper_id: str, *, html: str | None = None) -> dict:
+    """Give a paper parsed before the bibliography was kept its references, and link its citations to
+    them, without touching its clean-up or narration: arXiv's page is parsed again and each block (or
+    caption) takes over the new HTML only where its text is unchanged. `html`: the page, if at hand."""
+    from .arxiv import fetch_html
+    from .parse_html import parse_latexml
+
+    paper = load_paper(paper_id)
+    if paper.source != "arxiv-html":
+        raise ValueError(f"{paper_id} was read from a PDF ({paper.source}): it has no bibliography to add")
+    page_url = paper.html_url
+    if html is None:
+        html, page_url, _ = fetch_html(paper.arxiv_id, paper.version)
+    fresh = parse_latexml(html, page_url=page_url or paper.html_url or "", arxiv_id=paper.arxiv_id,
+                          version=paper.version, source_url=paper.source_url, include_appendix=paper.include_appendix)
+    blocks = {b.id: b for b in paper.iter_blocks()}
+    linked = skipped = 0
+    for new in fresh.iter_blocks():
+        old = blocks.get(new.id)
+        if old is None or old.html == new.html:
+            continue
+        if old.text == new.text and old.type == new.type:
+            old.html = new.html
+            linked += 1
+        else:
+            skipped += 1
+    for fig_id, new in fresh.figures.items():
+        old = paper.figures.get(fig_id)
+        if old and old.caption_text == new.caption_text and old.caption_html != new.caption_html:
+            old.caption_html = new.caption_html
+            linked += 1
+    paper.references = fresh.references
+    save_paper(paper)
+    return {"references": len(paper.references), "linked": linked, "skipped": skipped}
+
+
 def delete_paper(paper_id: str) -> dict:
     """Remove everything stored for one paper: its folder (text, figures, narrations, source PDF,
     clean-up exports), its voice-lab and sample clips and, for an uploaded PDF, the upload. The

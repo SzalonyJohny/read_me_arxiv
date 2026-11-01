@@ -34,7 +34,8 @@ from pydantic import BaseModel, ValidationError
 from . import pricing
 from .definitions import DefinitionIndex, atom_key, math_atoms, paper_vocabulary, symbol_key
 from .models import Block, CleanupStats, Paper, Section
-from .textfilter import apply_filter, equation_label, equation_speech, filter_text, inline_math, latex_to_speech
+from .textfilter import (apply_filter, equation_label, equation_reading, equation_speech, filter_text, inline_math,
+                         latex_to_speech)
 
 log = logging.getLogger(__name__)
 
@@ -93,11 +94,24 @@ earlier work works studies study colleagues example respect state versus approxi
 compare online about zero three four five seven eight nine eleven twelve thirteen fourteen fifteen
 sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred
 thousand million billion point half quarter third fourth fifth tenth hundredth thousandth
-equation equations
+equation equations cetera
 their them they these those this that then than when what whose whom with within without into onto
 upon under between across along through also only just both either neither other others same such
 very more most less much many some here there have been being were will would could should
 """.split())
+# Symbols mode reads display equations in full. A reading must say at least this share of the
+# symbols the rule reading says (counted with repeats), so a description of what the equation
+# computes ("the PPO objective is the expectation of the clipped ratio...") is rejected. On SAPG,
+# full readings cover 0.77-1.0 and such descriptions 0.13-0.72.
+MIN_SYMBOL_COVERAGE = 0.75
+EQUATION_LENGTH_FACTOR = 1.6  # a full reading may run this much longer than the rule reading
+_NOT_SYMBOLS = _SPOKEN_MATH | _RULE_WORDS | set("""
+the of to and by for is as in at it its an be min max exp log clip sin cos tan tanh sigmoid relu lim det tr
+diag sign arg sub sup if else for all
+""".split())
+_DIGITS = {w: str(i) for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+    "sixteen seventeen eighteen nineteen twenty".split())}
 _PROSE_TYPES = ("paragraph", "list_item", "heading_note")
 _MARKUP = re.compile(r"[\\$]|\[CITE\]|[{}]")
 _FIGURE_MENTION = re.compile(r"\b(Figure|Table)s? (\d+)")
@@ -128,11 +142,12 @@ years, titles or reference numbers.
 2. Inline maths. Say it the way a researcher reads it aloud ("alpha equals 0.5", "x t", \
 "the sum over i of", "pi theta of a given s"). Brackets inside maths are maths, not citations: \
 [0, 1] is "the interval from 0 to 1".
-3. Display equations. Begin with "Equation N:" when eq_number is given. If the equation is \
-short, read it verbatim. If it is long, give ONE plain-English sentence that says what it \
-computes, using the names that the context gives the symbols, for example "Equation 4: the \
-total loss is the reconstruction loss plus beta times the KL term." Prefer that over a bare \
-"Equation N."
+3. Display equations. Begin with "Equation N:" when eq_number is given, then read the whole \
+equation aloud the way a researcher reads it at the board: every symbol, term, operator, sum, \
+fraction, exponent and condition, in the same order. A long equation is still read in full, in \
+one or two flowing sentences. Never replace the symbols with a description of what the equation \
+computes, and never answer with a bare "Equation N." A label of several letters in a subscript \
+or superscript is said as a word: V^{target} is "V target", \\pi_{old} is "pi old".
 4. Abbreviations, numbers and units. "e.g." is "for example", "i.e." is "that is", "w.r.t." is \
 "with respect to", "SOTA" is "state of the art", "3.2 ms" is "3.2 milliseconds", "1e-4" is \
 "ten to the minus four", "±0.3" is "plus or minus 0.3", "∼40" is "about 40".
@@ -158,9 +173,19 @@ are the ONLY source of meanings.
 - Name a defined symbol by its meaning ("the reward at time step t", "the imitation weight", "the \
 discount factor") instead of its letters ("r t", "omega I", "gamma"). Indices become their \
 meaning too when it is defined ("at time step t", "of skill k", "at the previous iteration").
-- A symbol the paper does not define keeps its spoken name ("beta", "K", "x"). Never guess a meaning.
-- The worked examples use their own symbols. In a request, a symbol means only what that request's \
-definitions, context and block say: never carry a meaning over from an example or another paper.
+- A symbol the paper does not define, but uses in a standard role of its field, gets the field's \
+standard term, provided the paper's own text uses that term. In reinforcement learning: pi is "the \
+policy", V "the value function", Q "the Q function", A "the advantage function", gamma "the \
+discount factor", s "the state", a "the action", r "the reward", theta "the policy parameters". \
+Likewise in other fields: L "the loss", eta "the learning rate", u "the control input", q "the joint \
+positions", tau "the joint torques". Only when the block or its context shows the symbol in that role. \
+The paper's own definitions come first: a symbol that the definitions, context or block define, in \
+words or by a formula, keeps that meaning even where the field usually uses the letter for something \
+else (an r_t defined as the ratio of two policies is "the probability ratio", not "the reward").
+- Any other undefined symbol keeps its spoken name ("beta", "K", "x"). Never guess a meaning.
+- The worked examples use their own symbols. Apart from the field's standard terms, a symbol in a \
+request means only what that request's definitions, context and block say: never carry a meaning \
+over from an example or another paper.
 - One name per symbol for the whole paper: a symbol is read the same way in every equation and \
 sentence. When a request gives "names" (symbol -> name), use exactly those names.
 - For every block also return "symbols": each symbol you named by meaning, as {"latex": the bare \
@@ -176,8 +201,9 @@ _MEANING_INLINE = """- Symbols inside sentences (instead of rule 2): read a defi
 the sentence's own words; the rest of the sentence stays word for word. When the words right \
 before the symbol already name it ("the slip penalty $\\kappa_{t}$"), drop the symbol instead of \
 saying the name twice. But in the sentence that defines a symbol ("$u_{t}$ denotes the foot speed", \
-"with $u_{t}$ being ...", "where $u_{t}$ is ..."), keep the symbol's spoken letters: replacing it \
-there would make the definition say "the foot speed denotes the foot speed". A bracketed list of \
+"with $u_{t}$ being ...", "where $u_{t}$ is ..."), keep the symbol's spoken letters, also for a \
+symbol with a standard name in the field: replacing it there would make the definition say "the \
+foot speed denotes the foot speed". A bracketed list of \
 words ("$e \\in$ [left foot, right foot]") is a set, read "one of left foot, right foot", not an interval."""
 _SYMBOLS_EQUATIONS = "- Display equations are read as rule 3 says, symbol by symbol."
 _SYMBOLS_INLINE = "- Symbols inside sentences are read as rule 2 says, symbol by symbol."
@@ -261,15 +287,19 @@ _EXAMPLES = [
     _Example("A URL and a footnote mark",
              "Code and videos are available at https://lp-acrl.github.io.¹",
              "Code and videos are available online."),
-    _Example("A numbered display equation with a sum: one plain-English sentence",
+    _Example("A long display equation: still read in full, every symbol in order",
              r"\mathcal{L} = \sum_{t=1}^{T} \| \hat{x}_t - x_t \|^2 + \beta \, D_{\mathrm{KL}}"
              r"\big(q_\phi(z \mid x) \,\|\, p(z)\big)",
-             "Equation 4: the loss L is the squared error between x hat t and x t, summed over the "
-             "time steps t from 1 to T, plus beta times the KL divergence between q phi of z given x "
-             "and p of z.",
+             "Equation 4: L equals the sum from t equals 1 to T of the squared norm of x hat t minus "
+             "x t, plus beta times the KL divergence between q phi of z given x and p of z.",
              eq_number="4",
              context="We train the world model by minimizing a reconstruction loss and a KL regularizer:",
              context_after=r"where $\beta$ weights the KL term.", mode="symbols"),
+    _Example("Labels of several letters in sub- and superscripts are words",
+             r"V^{target}_{t} = r_{t} + \gamma \, V_{old}(s_{t+1})",
+             "Equation 6: V target t equals r t plus gamma times V old of s t plus 1.",
+             eq_number="6",
+             context="The critic regresses onto a bootstrapped target:", mode="symbols"),
     _Example("A short display equation: read it verbatim",
              r"a_t = \pi_\theta(o_t)",
              "Equation 2: a t equals pi theta of o t.",
@@ -322,6 +352,18 @@ _EXAMPLES = [
                           r"code $z$, and $p(z)$ is a standard normal prior."),
              symbols=((r"\mathcal{L}", "loss"), (r"\mathcal{L}_{\mathrm{rec}}", "reconstruction loss"),
                       (r"q_{\phi}(z\mid x)", "encoder distribution over the latent code"), ("p(z)", "standard normal prior"))),
+    _Example("Meaning mode: standard symbols of the field get the field's terms, when the paper uses them",
+             r"\delta_{t}=r_{t}+\gamma V(s_{t+1})-V(s_{t})",
+             "Equation 4: the temporal-difference error at time step t equals the reward at time step t plus the "
+             "discount factor times the value function of the next state, minus the value function of the state "
+             "at time step t.",
+             eq_number="4", mode="meaning",
+             context=r"The critic is trained on the temporal-difference error $\delta_{t}$:",
+             context_after="The actor then favours actions with a positive error.",
+             definitions=("At every time step the agent observes a state, takes an action and receives a reward; "
+                          "future rewards are weighted by a discount factor, and the critic learns the value function.",),
+             symbols=((r"\delta_{t}", "temporal-difference error"), ("r_{t}", "reward"), (r"\gamma", "discount factor"),
+                      ("V", "value function"), ("s_{t}", "state"))),
     _Example("Meaning mode: indices said by their meaning",
              r"\Delta_{k}=\bar{R}_{k}^{(i)}-\bar{R}_{k}^{(i-1)}",
              "Equation 6: the learning progress of skill k equals the average return of skill k at iteration "
@@ -346,6 +388,20 @@ _EXAMPLES = [
              r"Here, $u_{t}$ denotes the foot speed of leg $l \in$ [front left, front right], in meters per second.",
              "Here, u t denotes the foot speed of leg l, one of front left and front right, in meters per second.",
              mode="meaning"),
+    _Example("Symbols in sentences: the field's standard terms",
+             r"The update keeps $\pi_{\theta}$ close to $\pi_{\theta_{old}}$ and is stable for any $\gamma$ below 1.",
+             "The update keeps the policy close to the old policy and is stable for any discount factor below 1.",
+             mode="meaning",
+             definitions=("The old policy collected the data, and future rewards are weighted by a discount factor.",),
+             symbols=((r"\pi_{\theta}", "policy"), (r"\pi_{\theta_{old}}", "old policy"), (r"\gamma", "discount factor"))),
+    _Example("Symbols in sentences: a defining sentence keeps the letters, also for a standard symbol",
+             r"where $\hat{V}(s)$ is a value function that predicts the return from state $s$, and "
+             r"$\pi_{\theta}$ is updated to increase it.",
+             "where V hat of s is a value function that predicts the return from state s, and the policy is "
+             "updated to increase it.",
+             mode="meaning",
+             definitions=("The policy is a neural network with parameters theta.",),
+             symbols=((r"\pi_{\theta}", "policy"),)),
     _Example("Meaning mode: inline maths inside a sentence",
              r"For all tasks we set $\lambda_{1}=1.0$ and $\lambda_{2}=0.05$.",
              "For all tasks we set the tracking weight to 1.0 and the torque weight to 0.05.",
@@ -549,6 +605,40 @@ def _ungrounded(speech: str, filtered: str, vocabulary: set[str]) -> list[str]:
     return [w for w in added if len(w) > 3 and not (_word_forms(w) & known)]
 
 
+_COPULAS = {"is", "are", "denotes", "denote", "represents", "represent", "being", "means"}
+_FUNCTION_WORDS = {"the", "a", "an", "of", "and", "or", "to", "in", "on", "at", "by", "for", "with", "that", "this",
+                   "its", "their", "which", "where", "from", "as", "is", "are", "be", "been"}
+
+
+def _content_bigrams(words: list[str]) -> set[tuple[str, str]]:
+    return {(a, b.removesuffix("s")) for a, b in zip(words, words[1:])
+            if len(a) > 2 and len(b) > 2 and a not in _FUNCTION_WORDS and b not in _FUNCTION_WORDS}
+
+
+def _restated_names(text: str) -> set[str]:
+    """Phrases a sentence says before "is"/"denotes" and again right after it: "the estimated advantage
+    function ... is an advantage function" (a defining sentence whose symbol was replaced by its name)."""
+    found = set()
+    for sentence in re.split(r"[.;:?!]", text.lower()):
+        words = re.findall(r"[a-z0-9]+", sentence)
+        for i, word in enumerate(words):
+            if word in _COPULAS:
+                found |= {" ".join(pair) for pair in _content_bigrams(words[:i]) & _content_bigrams(words[i + 1:i + 8])}
+    return found
+
+
+def _symbol_words(text: str) -> Counter:
+    words = (_DIGITS.get(w, w) for w in re.findall(r"[a-z0-9]+", text.lower()))
+    return Counter(w for w in words if w not in _NOT_SYMBOLS)
+
+
+def symbol_coverage(rule_reading: str, speech: str) -> float:
+    """Share of the symbols in the rule reading of an equation that the speech says too (with repeats)."""
+    expected, said = _symbol_words(rule_reading), _symbol_words(speech)
+    total = sum(expected.values())
+    return 1.0 if total == 0 else sum(min(n, said[w]) for w, n in expected.items()) / total
+
+
 def guard_accepts(block: Block, speech: str, *, mode: EquationMode = "symbols", inline: EquationMode | None = None,
                   vocabulary: set[str] | None = None) -> bool:
     """Whether the model's speech may replace the filter speech of this block. Where maths is read by
@@ -573,9 +663,21 @@ def guard_reason(block: Block, speech: str, *, mode: EquationMode = "symbols", i
         unknown = _ungrounded(speech, filtered, vocabulary)
         if len(unknown) > MAX_UNGROUNDED:
             return f"words not found in the paper: {', '.join(unknown[:5])}"
+    if by_meaning and block.type != "equation":
+        restated = _restated_names(speech) - _restated_names(filtered)
+        if restated:
+            return (f'says "{sorted(restated)[0]}" twice in the sentence that defines it: keep the symbol\'s '
+                    f"letters in a defining sentence")
     if block.type == "equation":
-        limit = MAX_EQUATION_WORDS_MEANING if by_meaning else MAX_EQUATION_WORDS
         words = len(speech.split())
+        if by_meaning:
+            limit = MAX_EQUATION_WORDS_MEANING
+        else:
+            reference = equation_reading(block)
+            coverage = symbol_coverage(reference, speech)
+            if coverage < MIN_SYMBOL_COVERAGE:
+                return f"equation not read in full (says {coverage:.0%} of its symbols)"
+            limit = max(MAX_EQUATION_WORDS, round(EQUATION_LENGTH_FACTOR * len(reference.split())))
         return f"equation reading too long ({words} > {limit} words)" if words > limit else None
     before, after = _words(filtered), _words(speech)
     matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
@@ -624,6 +726,7 @@ class _Run:
     vocabulary: set[str] | None = None  # meaning mode: words the paper uses (grounding check)
     requests: list[CleanupRequest] = field(default_factory=list)
     uses: dict[str, list[_SymbolName]] = field(default_factory=dict)  # block id -> names its reading used
+    rejected: dict[str, str] = field(default_factory=dict)  # block id -> why the guard rejected its answer
     lock: threading.Lock = field(default_factory=threading.Lock)
     stopped: threading.Event = field(default_factory=threading.Event)
     done: int = 0
@@ -656,7 +759,7 @@ class _Run:
                 self.done += 1
                 done = self.done
             if self.progress_cb:
-                self.progress_cb(done / self.total, f"Clean-up {done}/{self.total}: {label}")
+                self.progress_cb(min(done / self.total, 1.0), f"Clean-up {done}/{self.total}: {label}")
 
     def _account(self, usage) -> None:
         input_tokens = usage.input_tokens or 0
@@ -677,7 +780,7 @@ class _Run:
         by_id: dict[str, _BlockSpeech] = {}
         for answer in answers:
             by_id.setdefault(answer.id, answer)
-        accepted = rejected = missing = 0
+        missing = 0
         for block in request.blocks:
             answer = by_id.get(block.id)
             speech = " ".join(answer.speech.split()) if answer else None
@@ -691,16 +794,17 @@ class _Run:
                 block.speech, block.speech_source = speech, "llm"
                 with self.lock:
                     self.uses[block.id] = answer.symbols
-                accepted += 1
+                    self.rejected.pop(block.id, None)
+            elif block.speech_source == "llm":
+                log.info("clean-up: %s keeps its earlier reading; the repair was rejected: %s", block.id, reason)
             else:
                 block.speech_source = "llm_rejected"
+                if block.type == "equation" and self.mode == "symbols":
+                    # the filter says only "Equation 4." for a long equation: read it in full instead
+                    block.speech = equation_reading(block) or block.speech
                 with self.lock:
                     self.uses.pop(block.id, None)
-                rejected += 1
-                self._warn(f"{block.id} kept the rule-based text: {reason}")
-        with self.lock:
-            self.stats.blocks_llm += accepted
-            self.stats.blocks_rejected += rejected
+                    self.rejected[block.id] = reason
         if missing:
             self._warn(f"{label}: {missing} block(s) missing from the answer; kept the filter text")
 
@@ -793,12 +897,16 @@ def consistency(run: "_Run") -> ConsistencyReport:
 
 
 def repair_requests(run: "_Run") -> list[CleanupRequest]:
-    """Blocks that named a symbol differently, asked again with the canonical names, once."""
-    report = consistency(run)
-    flagged = {block_id for block_id, *_ in report.issues}
+    """One more request per section for the blocks to fix: those that named a symbol differently from
+    the rest of the paper (meaning mode; asked again with the canonical names) and those whose answer
+    the guard rejected (asked again with the reason)."""
+    meaning = "meaning" in (run.mode, run.inline)
+    report = consistency(run) if meaning else None
+    inconsistent = {block_id for block_id, *_ in report.issues} if report else set()
+    flagged = inconsistent | set(run.rejected)
     if not flagged:
         return []
-    definitions = DefinitionIndex(run.paper)
+    definitions = DefinitionIndex(run.paper) if meaning else None
     requests = []
     for section in run.paper.sections:
         payloads, blocks = [], []
@@ -806,27 +914,37 @@ def repair_requests(run: "_Run") -> list[CleanupRequest]:
             if block.id not in flagged:
                 continue
             payload = _block_payload(section, index, definitions, run.mode, run.inline)
-            latex = block.latex if block.type == "equation" else " ".join(inline_math(block.text))
-            keys = {symbol_key(x.latex) for x in run.uses.get(block.id, [])}
-            keys |= {atom_key(a) for a in math_atoms(latex or "")}
-            payload["names"] = {report.shown[k]: report.names[k] for k in report.names if k in keys}
+            if report:
+                latex = block.latex if block.type == "equation" else " ".join(inline_math(block.text))
+                keys = {symbol_key(x.latex) for x in run.uses.get(block.id, [])}
+                keys |= {atom_key(a) for a in math_atoms(latex or "")}
+                payload["names"] = {report.shown[k]: report.names[k] for k in report.names if k in keys}
+            if block.id in run.rejected:
+                payload["problem"] = f"your previous answer was rejected: {run.rejected[block.id]}"
             payloads.append(payload)
             blocks.append(block)
         if blocks:
             heading = section.speech_title or section.title
-            message = (f"Paper: {run.paper.title}\nSection: {heading}\n\nThese blocks named some symbols "
-                       f"differently from the rest of the paper. Use exactly the names in \"names\" for those "
-                       f"symbols (with \"the\" and the indices as usual).\n"
+            message = (f"Paper: {run.paper.title}\nSection: {heading}\n\nThese blocks are asked again. Where a "
+                       f"block has \"names\", use exactly those names for those symbols (with \"the\" and the "
+                       f"indices as usual). Where it has \"problem\", your previous answer was rejected for that "
+                       f"reason: fix it, and follow the rules and examples exactly.\n"
                        f"Return the narration of these {len(blocks)} blocks:\n"
                        f"{json.dumps(payloads, ensure_ascii=False, indent=1)}")
             requests.append(CleanupRequest(section, blocks, message))
     with run.lock:
-        run.stats.symbols_repaired += len(flagged)
+        run.stats.symbols_repaired += len(inconsistent)
     return requests
 
 
 def finish(run: "_Run") -> CleanupStats:
-    """Close a pass: in meaning mode record the symbol names and any remaining inconsistency."""
+    """Close a pass: count the blocks, warn about answers still rejected, and in meaning mode record
+    the symbol names and any remaining inconsistency."""
+    asked = {b.id for request in run.requests for b in request.blocks}
+    run.stats.blocks_llm = sum(1 for b in run.paper.iter_blocks() if b.id in asked and b.speech_source == "llm")
+    run.stats.blocks_rejected = len(run.rejected)
+    for block_id, reason in run.rejected.items():
+        run._warn(f"{block_id} kept the rule-based text: {reason}")
     if "meaning" in (run.mode, run.inline):
         report = consistency(run)
         run.stats.symbol_names = {report.shown[k]: name for k, name in report.names.items()}
@@ -942,8 +1060,7 @@ def cleanup_paper(paper: Paper, *, client=None, model: str = MODEL, max_workers:
         run.execute(requests[0])  # writes the prompt cache; parallel requests could not read it yet
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             list(pool.map(run.execute, requests[1:]))
-    if "meaning" in (run.mode, run.inline) and not run.stopped.is_set():
-        repairs = repair_requests(run)  # blocks that named a symbol differently, asked once more
+    if not run.stopped.is_set() and (repairs := repair_requests(run)):  # inconsistent names, rejected answers
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             list(pool.map(run.execute, repairs))
     return finish(run)

@@ -676,8 +676,11 @@ def _render(nodes: list, ctx: str = "") -> str:
             out.append(node.prose if leading and node.prose else _relation_words(node, ctx))
             prev = "rel"
         elif isinstance(node, _Sym) and node.kind == "op":
-            out.append(node.words)
-            prev = "op"
+            # \cdot with nothing on either side is a placeholder: pi(\cdot | s) is "pi of dot given s"
+            placeholder = node.words == "times" and prev in ("", "op", "rel", "punct") and \
+                (nxt is None or (isinstance(nxt, _Sym) and nxt.kind in ("rel", "punct", "sep")))
+            out.append("dot" if placeholder else node.words)
+            prev = "operand" if placeholder else "op"
         elif isinstance(node, _Sym) and node.kind == "punct":
             out.append(_punct_words(node, ctx, nodes[i + 1:]))
             prev = "punct"
@@ -803,6 +806,42 @@ def _power_of_ten(node) -> int | None:
     return None
 
 
+_INDEX_LETTERS = set("ijklmnstxyz")  # runs of these alone are indices or coordinates: x_{ij}, w_{kl}, e_{xyz}
+_SHORT_LABELS = {"on", "in", "up", "min", "init", "lin"}
+
+
+def _is_label(word: str) -> bool:
+    """'old', 'target', 'critic' are labels; 'ijk', 'xyz', 'iwt' (e^{iwt}) are letters."""
+    if len(word) < 3 or set(word) <= _INDEX_LETTERS:
+        return False
+    return bool(set(word) & set("aeou")) or ("i" in word and len(word) >= 5)
+
+
+def _label_words(nodes: list) -> list:
+    """Italic letter runs in a sub- or superscript that spell a label are read as a word:
+    V^{target} is "V target", pi_{old} "pi old", lambda_{ent} "lambda ent". Index runs such as
+    x_{ij} or w_{kl} (no vowel, or only index letters) stay separate letters."""
+    out: list = []
+    run: list[_Sym] = []
+
+    def flush() -> None:
+        word = "".join(n.words for n in run)
+        if word in _SHORT_LABELS or _is_label(word):
+            out.append(_Sym(word, "text"))
+        else:
+            out.extend(run)
+        run.clear()
+
+    for n in _unwrap(nodes):
+        if isinstance(n, _Sym) and n.kind == "var" and len(n.words) == 1 and "a" <= n.words <= "z":
+            run.append(n)
+        else:
+            flush()
+            out.append(n)
+    flush()
+    return out
+
+
 def _render_script(node: _Script, ctx: str) -> str:
     base = node.base
     if base is None:  # "$^{1}$" footnote marks, "m$^2$", "$^\circ$"
@@ -813,6 +852,7 @@ def _render_script(node: _Script, ctx: str) -> str:
     exponent = _power_of_ten(node)
     if exponent is not None:
         return f"ten to the {_number_words(exponent)}"
+    node = _Script(base, node.sub and _label_words(node.sub), node.sup and _label_words(node.sup))
     if isinstance(base, _Group) and base.open == "norm":
         kind = _render(node.sub or [], "sub")
         squared = "squared " if node.sup and _sup_words(node.sup) == "squared" else ""
@@ -1260,10 +1300,25 @@ EQUATION_MAX_WORDS = 25  # longer readings are left to the LLM pass ("Equation 4
 EQUATION_MAX_LATEX = 120
 
 
+def _equation_latex(block: Block) -> str:
+    return re.sub(r"(?:\\[,;:!]|\\quad|\s|[.,;])+$", "", block.latex or "")
+
+
+def equation_reading(block: Block) -> str:
+    """Rules-only reading of the whole display equation, however long: 'Equation 4: x equals ...'.
+    The reference for checking that an LLM reading says every symbol (equations read by symbols)."""
+    latex = _equation_latex(block)
+    reading = _convert(latex)[0] if latex else ""
+    label = equation_label(block.eq_number)
+    if not reading:
+        return f"{label}." if label else ""
+    return f"{label}: {reading}." if label else f"{reading}."
+
+
 def equation_speech(block: Block) -> str:
     """Rules-only reading of a display equation: 'Equation 4: x equals ...' when it is short and
     fully understood, else 'Equation 4.' (numbered) or 'An equation follows.' (unnumbered)."""
-    latex = re.sub(r"(?:\\[,;:!]|\\quad|\s|[.,;])+$", "", block.latex or "")
+    latex = _equation_latex(block)
     reading, clean = _convert(latex) if latex else ("", False)
     short = (clean and reading and len(reading.split()) <= EQUATION_MAX_WORDS
              and len(latex) <= EQUATION_MAX_LATEX and r"\\" not in latex and r"\begin" not in latex)

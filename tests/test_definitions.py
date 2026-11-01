@@ -80,8 +80,10 @@ def test_vocabulary_and_grounding_guard():
                 "step t, plus the task weight times the task objective at step t.")
     assert cleanup.guard_accepts(equation, grounded, mode="meaning", vocabulary=vocabulary)
     assert not cleanup.guard_accepts(equation, invented, mode="meaning", vocabulary=vocabulary)
-    # symbols mode keeps the old behaviour: no grounding check, shorter equation limit
-    assert cleanup.guard_accepts(equation, invented, mode="symbols")
+    # symbols mode: no grounding check, but the equation must be read symbol by symbol
+    assert not cleanup.guard_accepts(equation, grounded, mode="symbols")
+    assert cleanup.guard_accepts(equation, "Equation 3: r t equals omega I times r t I plus omega G times r t G.",
+                                 mode="symbols")
 
 
 def test_apposition_counts_as_a_definition_and_every_symbol_gets_one():

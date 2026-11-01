@@ -7,6 +7,7 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect x=%272%27 y=%271%27 width=%2712%27 height=%2714%27 rx=%272%27 fill=%27%232b5c8e%27/%3E%3Cpath d=%27M5 5h6M5 8h6M5 11h4%27 stroke=%27white%27 stroke-width=%271.3%27/%3E%3C/svg%3E">
   <link rel="manifest" href="/manifest.webmanifest">
   <meta name="theme-color" content="#2b5c8e">
+  <meta name="mobile-web-app-capable" content="yes">
   <link rel="stylesheet" href="/static/vendor/fonts/source-serif-4.css">
   <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/static/common.css">
@@ -24,14 +25,35 @@
       <details class="menu toc" id="toc">
         <summary title="Jump to a section">
           <span class="short-title" id="short-title">Loading…</span>
+          <span class="full-title" id="full-title"></span>
           <svg class="icon caret" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </summary>
         <nav class="menu-panel" id="toc-list" aria-label="Sections"></nav>
       </details>
       <div class="toggles" role="group" aria-label="View options">
         <label class="switch"><input type="checkbox" id="opt-cites"><span>Citations</span></label>
-        <label class="switch"><input type="checkbox" id="opt-speech"><span>Speech text</span></label>
         <label class="switch"><input type="checkbox" id="opt-follow" checked><span>Auto-follow</span></label>
+        <div class="speed" id="speed" hidden>
+          <button class="speed-btn" type="button" id="speed-btn" aria-expanded="false" aria-controls="speed-panel"
+                  title="Playback speed">
+            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.6 11.5a6 6 0 1 1 10.8 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="m8 9.6 2.6-3.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="9.6" r="1.1" fill="currentColor"/></svg>
+            <span id="speed-value">1.0×</span>
+          </button>
+          <div class="menu-panel speed-panel" id="speed-panel" role="group" aria-label="Playback speed" hidden>
+            <div class="speed-head">
+              <span class="muted">Playback speed</span>
+              <output class="speed-out" id="speed-out" for="speed-range">1.0×</output>
+              <button class="btn quiet speed-reset" type="button" id="speed-reset" title="Back to normal speed">1×</button>
+            </div>
+            <div class="speed-row">
+              <button class="btn quiet" type="button" id="speed-down" aria-label="Slower by 0.1">−</button>
+              <input type="range" id="speed-range" min="0.5" max="2.5" step="0.1" value="1" list="speed-ticks"
+                     aria-label="Playback speed">
+              <button class="btn quiet" type="button" id="speed-up" aria-label="Faster by 0.1">+</button>
+            </div>
+            <datalist id="speed-ticks"><option value="0.5"></option><option value="1"></option><option value="1.5"></option><option value="2"></option><option value="2.5"></option></datalist>
+          </div>
+        </div>
       </div>
       <span class="badge offline-badge" id="offline-badge" title="The server is out of reach: reading the copy saved on this device" hidden>Offline copy</span>
       <div class="offline" id="offline">
@@ -58,12 +80,18 @@
       </button>
       <button class="btn quiet skip" type="button" id="pl-back" title="Back 15 seconds">−15</button>
       <button class="btn quiet skip" type="button" id="pl-fwd" title="Forward 15 seconds">+15</button>
-      <input class="seek" type="range" id="pl-seek" min="0" max="0" step="0.1" value="0" aria-label="Seek">
-      <span class="time" id="pl-time">0:00 / 0:00</span>
-      <select id="pl-rate" aria-label="Playback speed"></select>
+      <div class="seek-wrap">
+        <input class="seek" type="range" id="pl-seek" min="0" max="0" step="0.1" value="0" aria-label="Seek">
+        <div class="seek-marks" id="pl-marks" aria-hidden="true"></div>
+      </div>
+      <button class="time" type="button" id="pl-time" aria-controls="pl-seek" aria-expanded="false"
+              title="Show the position slider">0:00 / 0:00</button>
       <select id="pl-run" aria-label="Narration run" hidden></select>
+      <button class="btn quiet fs-btn" type="button" id="pl-fullscreen" aria-label="Full screen" title="Full screen" hidden>
+        <svg class="icon i-expand" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <svg class="icon i-collapse" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
     </div>
-    <p class="now-reading" id="now-reading" aria-live="off" hidden></p>
   </header>
 
   <div class="panes">

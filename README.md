@@ -16,9 +16,11 @@ Everything runs locally on your machine. Paid services are optional, and nothing
 - **Clean-up for listening**
   - First a rule-based filter removes citation markers and expands "Fig."/"Eq."/"e.g.". It also reads units and simple maths aloud.
   - Then an optional LLM pass reads equations aloud and repairs sentences that the citation removal broke. It can use Claude Haiku 5.5 (Anthropic API) or Codex (`gpt-6-luna`, through your ChatGPT plan).
-  - A guard keeps the rule-based text wherever the LLM paraphrases too much.
+  - Read by symbols, every display equation is read in full, symbol by symbol. Labels such as `V^{target}` or `\pi_{old}` are said as words ("V target", "pi old").
+  - A guard checks every answer. It rejects paraphrases, equations described instead of read, and anything that lost a symbol, and the rejected block is asked once more with the reason. If it still fails, the rule-based text is kept.
   - **Read equations by meaning** (checkbox, on by default): with an LLM clean-up, maths can be read by what the paper defines the symbols as. For example, "r t equals omega I r t I plus omega G r t G" becomes "the reward at time step t equals the imitation weight times the imitation objective plus the task weight times the task objective".
-    - The meanings come only from the paper's own definition sentences, which are found automatically and sent with each equation.
+    - The meanings come from the paper's own definition sentences, which are found automatically and sent with each equation.
+    - Symbols used in a standard role of the field get the field's terms when the paper uses those words: π is "the policy", V "the value function", A "the advantage function", γ "the discount factor".
     - A grounding check rejects any word the paper doesn't use, and a consistency check makes sure a symbol gets the same name in every equation.
   - **Read symbols in the text by meaning** (second checkbox, on by default): the same for maths inside sentences. For example, "the center-of-mass reward r t to the c penalizes…" becomes "the center-of-mass reward penalizes…", and a symbol on its own is read by its meaning. The sentence that defines a symbol keeps its letters, so the definition still says something.
 - **Narration**
@@ -27,9 +29,12 @@ Everything runs locally on your machine. Paid services are optional, and nothing
   - **ElevenLabs**: paid, used only after you accept the estimate.
   - Rendered clips are cached, so a re-run only voices the paragraphs that changed.
 - **Reader**
-  - Two panes, with KaTeX maths and citations you can show or hide.
-  - The left pane follows the narration, and the right pane shows the most recently mentioned figure.
-  - Click a paragraph to jump there in the audio.
+  - Two panes, with KaTeX maths and citations you can show or hide. Tap a citation such as [14] to see the referenced title; tap it again to search for it on Google in a new tab. A tap on or near a citation never moves the narration.
+  - The left pane follows the narration, with the sentence being read softly highlighted, and the right pane shows the most recently mentioned figure.
+  - Click a paragraph to jump there in the audio. Click an equation to see how it is read aloud. *About this text* can show the spoken text under every paragraph.
+  - Playback speed from 0.5× to 2.5× in steps of 0.1 (the speed button next to *Auto-follow*). The position slider marks where each section starts.
+  - On a phone the layout is compact: the title on one small line, the settings on one line below it, and play with −15/+15 at the bottom of the screen. Tap the time to open the position slider. Citations are always shown.
+  - On a phone, the button at the bottom right goes full screen, which hides Chrome's address bar. Chrome then shows its own notice on how to leave, which a page can't change. Opened from a home-screen icon, the app has no address bar and no notice.
 - **Voice lab** (`/voices`)
   - Hear the start of the abstract in every Kokoro voice.
   - Design Qwen3 voices from a description, and redesign them for a new take.
@@ -86,6 +91,7 @@ uv run paper-reader ingest https://arxiv.org/pdf/2601.17428 [--appendix] [--llm 
 uv run paper-reader cleanup 2601.17428v1 --llm codex          # re-run the clean-up
 uv run paper-reader cleanup 1804.02717v3 --llm codex --equations symbols --inline symbols   # read maths symbol by symbol instead
 uv run paper-reader estimate 2601.17428v1                     # characters, minutes, cost per engine
+uv run paper-reader references                               # add the bibliography (citation titles) to papers ingested before it was kept
 uv run paper-reader voices --engine kokoro
 uv run paper-reader samples --paper 2601.17428v1 --abstract --voices all          # compare every Kokoro voice
 uv run paper-reader samples --engine qwen3 --model 0.6B,1.7B --voices technical_male --paper 2601.17428v1 --abstract

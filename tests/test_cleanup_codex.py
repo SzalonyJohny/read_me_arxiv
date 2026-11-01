@@ -40,7 +40,8 @@ def test_codex_answers_go_through_the_same_guard(codex_ok, monkeypatch):
     assert stats.model == "codex:gpt-6-luna" and stats.cost_usd == 0.0
     assert (stats.blocks_llm, stats.blocks_rejected) == (4, 1)  # b0006 is a summary: rejected
     assert blocks["b0002"].speech == GOOD_ANSWERS["b0002"] and blocks["b0006"].speech_source == "llm_rejected"
-    assert (stats.input_tokens, stats.output_tokens, stats.cache_read_input_tokens) == (2000, 100, 400)
+    # two sections, then one repair request for the rejected b0006 (rejected again: same answer)
+    assert (stats.input_tokens, stats.output_tokens, stats.cache_read_input_tokens) == (3000, 150, 600)
 
 
 def test_a_failed_section_keeps_the_filter_text(codex_ok, monkeypatch):

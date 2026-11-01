@@ -116,8 +116,8 @@ def cleanup_paper_codex(paper: Paper, *, model: str = CODEX_MODEL, effort: str =
                                          equation_mode=run.mode, inline_mode=run.inline)
             return paper.cleanup
         cleanup.apply_answers(run, run.requests, answers)
-        if "meaning" in (run.mode, run.inline) and (repairs := cleanup.repair_requests(run)):
-            repaired, _ = ask(repairs, len(run.requests), "Consistency repair")
+        if repairs := cleanup.repair_requests(run):  # inconsistent names and rejected answers, asked once more
+            repaired, _ = ask(repairs, len(run.requests), "Repair")
             cleanup.apply_answers(run, repairs, repaired)
 
     stats = cleanup.finish(run)
