@@ -77,9 +77,11 @@ class _FakeQwenModel:
 
     def __init__(self):
         self.batches: list[list[str]] = []
+        self.limits: list[int] = []
 
-    def generate_voice_clone(self, text, language, voice_clone_prompt):
+    def generate_voice_clone(self, text, language, voice_clone_prompt, max_new_tokens):
         self.batches.append(list(text))
+        self.limits.append(max_new_tokens)
         return [_tone(0.01 * len(t)) for t in text], SR
 
 
@@ -126,3 +128,92 @@ def test_decoding_is_chunked():
     wavs, sr = model.model.speech_tokenizer.decode([{"audio_codes": i} for i in range(10)])
     assert wavs == [f"wav{i}" for i in range(10)] and sr == SR
     assert calls == [4, 4, 2]
+
+
+def _engine_with(fake, tmp_path, monkeypatch, batch=4):
+    from paper_reader.tts import qwen_engine
+
+    monkeypatch.setattr(qwen_engine, "_model", lambda repo, device: fake)
+    monkeypatch.setattr(qwen_engine, "BATCH_SENTENCES", batch)
+    engine = QwenTTSEngine("0.6B", voice_dir=tmp_path, device="cpu")
+    monkeypatch.setattr(engine, "reference_clip", lambda voice: (tmp_path / "ref.wav", "ref"))
+    monkeypatch.setattr(engine, "_clone_prompt", lambda model, voice, ref: ["prompt"])
+    return engine
+
+
+def test_each_batch_gets_a_code_limit_from_its_longest_sentence(tmp_path, monkeypatch):
+    from paper_reader.tts.qwen_engine import CODES_PER_SECOND, code_limit, max_seconds
+
+    fake = _FakeQwenModel()
+    engine = _engine_with(fake, tmp_path, monkeypatch, batch=2)
+    sentences = ["Short.", "A bit longer.", "This sentence is the longest one of them all by far."]
+    engine.synthesize_many([" ".join(sentences)], "technical_male")
+    assert fake.limits == [code_limit(b) for b in fake.batches]
+    assert fake.limits[-1] == code_limit(sentences[-1:])  # (8192 by default: MP1 ran out of memory)
+    assert fake.limits[-1] / CODES_PER_SECOND * 0.9 > max_seconds(sentences[-1])  # stopped by it = a runaway
+    assert code_limit(["x" * 338]) < 1100  # MP1's longest sentence: 90 s of codes, not 8192 codes (11 min)
+
+
+def test_a_runaway_sentence_is_generated_again_on_its_own(tmp_path, monkeypatch):
+    """A sentence that never emits its end code runs to the batch's limit; it is retried alone."""
+    from paper_reader.tts.qwen_engine import RUNAWAY_RETRIES, max_seconds
+
+    class Runaway(_FakeQwenModel):
+        def __init__(self, fails):
+            super().__init__()
+            self.fails = fails
+
+        def generate_voice_clone(self, text, language, voice_clone_prompt, max_new_tokens):
+            self.batches.append(list(text))
+            self.limits.append(max_new_tokens)
+            wavs = []
+            for t in text:
+                if t.startswith("Stuck") and self.fails:
+                    self.fails -= 1
+                    wavs.append(_tone(max_new_tokens / 12))  # ran to the limit
+                else:
+                    wavs.append(_tone(0.01 * len(t)))
+            return wavs, SR
+
+    text = "Stuck sentence here. Fine one. Another fine sentence."
+    fake = Runaway(fails=1)
+    result = _engine_with(fake, tmp_path, monkeypatch).synthesize_many([text], "technical_male")[0]
+    assert fake.batches == [["Fine one.", "Stuck sentence here.", "Another fine sentence."], ["Stuck sentence here."]]
+    stuck = next(c for c in result.chunks if c.text.startswith("Stuck"))
+    assert stuck.end - stuck.start < 1.0
+
+    fake = Runaway(fails=RUNAWAY_RETRIES + 1)  # never recovers: the shortest take is kept, the run goes on
+    result = _engine_with(fake, tmp_path, monkeypatch).synthesize_many([text], "technical_male")[0]
+    assert len(fake.batches) == 1 + RUNAWAY_RETRIES
+    stuck = next(c for c in result.chunks if c.text.startswith("Stuck"))
+    assert stuck.end - stuck.start <= max_seconds("Stuck sentence here.") * 3
+
+
+def test_out_of_memory_splits_the_batch(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from paper_reader.tts import qwen_engine
+
+    class Small(_FakeQwenModel):
+        def generate_voice_clone(self, text, language, voice_clone_prompt, max_new_tokens):
+            if len(text) > 2:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 106.00 MiB.")
+            return super().generate_voice_clone(text, language, voice_clone_prompt, max_new_tokens)
+
+    freed = []
+    monkeypatch.setattr(qwen_engine, "_free_cached_memory", lambda: freed.append(1))
+    fake = Small()
+    texts = ["One sentence. Two sentences here.", "Three is longer than two. Four is the longest one here, yes. Five."]
+    results = _engine_with(fake, tmp_path, monkeypatch, batch=8).synthesize_many(texts, "technical_male")
+    assert all(len(b) <= 2 for b in fake.batches) and sum(len(b) for b in fake.batches) == 5
+    for text, result in zip(texts, results):
+        assert [c.text for c in result.chunks] == qwen_engine.split_sentences(text)
+        for chunk in result.chunks:
+            assert chunk.end - chunk.start == pytest.approx(0.01 * len(chunk.text), abs=0.02)
+    assert freed  # cached memory handed back after the split and at the end
+
+    class Never(_FakeQwenModel):
+        def generate_voice_clone(self, text, language, voice_clone_prompt, max_new_tokens):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 106.00 MiB.")
+
+    with pytest.raises(RuntimeError, match="out of GPU memory even one sentence at a time"):
+        _engine_with(Never(), tmp_path, monkeypatch).synthesize_many(["A. B."], "technical_male")

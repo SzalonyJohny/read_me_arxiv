@@ -17,6 +17,8 @@ import contextlib
 import hashlib
 import io
 import json
+import logging
+import math
 import re
 import sys
 import threading
@@ -57,6 +59,29 @@ BATCH_SENTENCES = 32
 # The library decodes a whole batch to audio at once, each item with the 11 s reference prepended;
 # decoding 4 at a time keeps peak VRAM at ~5 GB (0.6B) / ~7.5 GB (1.7B) instead of running out at 16.
 DECODE_CHUNK = 4
+# How long a sentence may take. The model's own limit is 8192 codes (11 minutes): a sentence that
+# never emits its end code keeps its whole batch generating, and the batch's attention cache grows
+# (~112 KB per code per sentence for the 0.6B) until the GPU runs out (MP1, batch 32). Narration
+# runs at ~0.06 s per character (the slowest cached sentence: 0.12), so 0.2 s per character plus
+# 5 s is generous; a sentence that takes longer ran away and is generated again on its own.
+CODES_PER_SECOND = 12
+MAX_SECONDS_PER_CHAR = 0.2
+MAX_EXTRA_SECONDS = 5.0
+RUNAWAY_RETRIES = 2
+
+log = logging.getLogger(__name__)
+
+
+def max_seconds(sentence: str) -> float:
+    """The longest a sentence's clip may be before it counts as a runaway."""
+    return MAX_EXTRA_SECONDS + MAX_SECONDS_PER_CHAR * len(sentence)
+
+
+def code_limit(sentences: list[str]) -> int:
+    """max_new_tokens for a batch: a margin above its longest sentence's max_seconds, so that a
+    sentence stopped by the limit is always longer than its max_seconds and is retried (a clip
+    comes out a little shorter than its codes: 18 codes gave 1.36 s, not 1.5 s)."""
+    return math.ceil(CODES_PER_SECOND * (1.2 * max(max_seconds(s) for s in sentences) + 2))
 
 _lock = threading.Lock()
 _loaded: dict[str, object] = {}  # single slot: repo id -> Qwen3TTSModel (12 GB GPU holds one comfortably)
@@ -149,11 +174,25 @@ def release_gpu() -> None:
     """Drop the loaded Qwen model (e.g. before local OCR needs the GPU); it reloads on next use."""
     with _lock:
         _loaded.clear()
+    _free_cached_memory()
+
+
+def _free_cached_memory() -> None:
+    """Give PyTorch's cached but unused GPU memory back, so an idle server doesn't hold the GPU."""
     if "torch" in sys.modules:
         import torch
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def _out_of_memory_error() -> type[BaseException]:
+    try:
+        import torch
+
+        return torch.cuda.OutOfMemoryError
+    except (ImportError, AttributeError):  # no torch: nothing raises it
+        return type("NoOutOfMemoryError", (Exception,), {})
 
 
 def _chunk_decoding(model) -> None:
@@ -243,35 +282,84 @@ class QwenTTSEngine:
     def synthesize_many(self, texts: list[str], voice: str, speed: float = 1.0) -> list[SynthResult]:
         """Voice several units at once. Their sentences are pooled, sorted by length (so a batch
         doesn't wait on one long sentence) and generated BATCH_SENTENCES at a time; each unit is
-        then reassembled from its own sentences. ~13x faster than one sentence per call."""
+        then reassembled from its own sentences. ~13x faster than one sentence per call.
+
+        Every batch has a code limit (code_limit); a sentence that runs past its max_seconds is
+        generated again on its own, and a batch that runs out of GPU memory is split in half."""
         per_unit = [split_sentences(text) for text in texts]
         keys = sorted(((u, i) for u, sentences in enumerate(per_unit) for i in range(len(sentences))),
                       key=lambda k: len(per_unit[k[0]][k[1]]))
-        description = self._description(voice)
         if keys and self.model != "1.7B-design":
             reference = self.reference_clip(voice)  # outside the lock: may load the design model itself
 
         clips: dict[tuple[int, int], np.ndarray] = {}
         sample_rate = 24_000
+        out_of_memory = None
         if keys:
             with _lock:
                 model = _model(MODELS[self.model]["repo"], self.device)
-                for start in range(0, len(keys), BATCH_SENTENCES):
-                    batch_keys = keys[start:start + BATCH_SENTENCES]
-                    batch = [per_unit[u][i] for u, i in batch_keys]
-                    languages = [LANGUAGE] * len(batch)
-                    if self.model == "1.7B-design":
-                        wavs, sample_rate = model.generate_voice_design(
-                            text=batch, instruct=[description] * len(batch), language=languages)
-                    else:
-                        prompt = self._clone_prompt(model, voice, reference)
-                        wavs, sample_rate = model.generate_voice_clone(
-                            text=batch, language=languages, voice_clone_prompt=prompt)
-                    clips.update(zip(batch_keys, (np.asarray(w, dtype=np.float32) for w in wavs)))
+                generate = self._generator(model, voice, reference if self.model != "1.7B-design" else None)
+                try:
+                    for start in range(0, len(keys), BATCH_SENTENCES):
+                        batch_keys = keys[start:start + BATCH_SENTENCES]
+                        wavs, sample_rate = self._generate_checked(generate, [per_unit[u][i] for u, i in batch_keys])
+                        clips.update(zip(batch_keys, wavs))
+                except _out_of_memory_error() as exc:  # even one sentence at a time
+                    out_of_memory = str(exc).split(". ")[0]
+                finally:
+                    _free_cached_memory()  # runs after the except block, which drops the failed call's tensors
+                if out_of_memory:
+                    raise RuntimeError(f"Qwen3-TTS ran out of GPU memory even one sentence at a time "
+                                       f"({out_of_memory}). Close other programs using the GPU and try again.")
 
         return [self._assemble(sentences, [clips[(u, i)] for i in range(len(sentences))], sample_rate, speed)
                 if sentences else SynthResult(audio=np.zeros(0, dtype=np.float32), sample_rate=sample_rate)
                 for u, sentences in enumerate(per_unit)]
+
+    def _generator(self, model, voice: str, reference: tuple[Path, str] | None):
+        """generate(sentences) -> (wavs, sample_rate): one call of the library, with a code limit."""
+        description = self._description(voice)
+
+        def generate(batch: list[str]):
+            languages = [LANGUAGE] * len(batch)
+            if self.model == "1.7B-design":
+                return model.generate_voice_design(text=batch, instruct=[description] * len(batch),
+                                                   language=languages, max_new_tokens=code_limit(batch))
+            return model.generate_voice_clone(text=batch, language=languages, max_new_tokens=code_limit(batch),
+                                              voice_clone_prompt=self._clone_prompt(model, voice, reference))
+        return generate
+
+    def _generate_checked(self, generate, batch: list[str]) -> tuple[list[np.ndarray], int]:
+        """One batch, split in half while it runs out of GPU memory; runaway sentences generated again."""
+        wavs, sample_rate = self._generate_fitting(generate, batch)
+        for n, sentence in enumerate(batch):
+            for attempt in range(RUNAWAY_RETRIES):
+                if len(wavs[n]) / sample_rate <= max_seconds(sentence):
+                    break
+                log.warning("Qwen3-TTS: a %d-character sentence ran %.0f s (limit %.0f s); generating it again "
+                            "(%d/%d)", len(sentence), len(wavs[n]) / sample_rate, max_seconds(sentence),
+                            attempt + 1, RUNAWAY_RETRIES)
+                [again], _ = self._generate_fitting(generate, [sentence])
+                if len(again) < len(wavs[n]):
+                    wavs[n] = again
+        return wavs, sample_rate
+
+    def _generate_fitting(self, generate, batch: list[str]) -> tuple[list[np.ndarray], int]:
+        split = False
+        try:
+            wavs, sample_rate = generate(batch)
+        except _out_of_memory_error():
+            if len(batch) == 1:
+                raise
+            split = True  # retried below, once this except block has dropped the failed call's tensors
+        if split:
+            _free_cached_memory()
+            log.warning("Qwen3-TTS: out of GPU memory with %d sentences; splitting the batch", len(batch))
+            half = len(batch) // 2
+            first, sample_rate = self._generate_fitting(generate, batch[:half])
+            second, sample_rate = self._generate_fitting(generate, batch[half:])
+            return first + second, sample_rate
+        return [np.asarray(w, dtype=np.float32) for w in wavs], sample_rate
 
     def _clone_prompt(self, model, voice: str, reference: tuple[Path, str]):
         """Built once per voice: it depends only on this engine's (fixed) model weights."""
